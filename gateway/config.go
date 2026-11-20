@@ -49,7 +49,8 @@ type ServerConfig struct {
 	TrustedProxies []string `json:"trustedProxies,omitempty"`
 
 	// ExposeValidationErrors includes schema error details in 400 responses.
-	// Defaults to true; set false to return only a generic message.
+	// Defaults to false: a contract violation gets the same generic "bad
+	// request" as an upstream 400, and the failing locations are only logged.
 	ExposeValidationErrors *bool `json:"exposeValidationErrors,omitempty"`
 
 	// AccessLog enables structured per-request logging. Defaults to true.
@@ -82,6 +83,7 @@ type RouteDefaults struct {
 	Hardening       HardeningConfig `json:"hardening"`
 	Auth            []string        `json:"auth,omitempty"`
 	Timeout         Duration        `json:"timeout,omitempty"`
+	RequestHeaders  HeaderRules     `json:"requestHeaders"`
 	ResponseHeaders HeaderRules     `json:"responseHeaders"`
 }
 
@@ -103,7 +105,8 @@ type RouteConfig struct {
 	Upstream UpstreamConfig `json:"upstream"`
 
 	// Auth lists authenticator names; the first that succeeds wins. An empty
-	// list inherits Defaults.Auth. Use ["anonymous"] to explicitly disable.
+	// list inherits Defaults.Auth, and one of the two must be set. Use
+	// ["anonymous"] to serve the route without authentication.
 	Auth           []string          `json:"auth,omitempty"`
 	RequiredScopes []string          `json:"requiredScopes,omitempty"`
 	ForwardHeaders map[string]string `json:"forwardIdentity,omitempty"`
@@ -128,8 +131,12 @@ type UpstreamConfig struct {
 	// Path optionally rewrites the upstream path. {name} placeholders are
 	// replaced by route parameters and {*} by the wildcard remainder. When
 	// empty the inbound path is forwarded unchanged.
-	Path         string   `json:"path,omitempty"`
+	Path string `json:"path,omitempty"`
+	// PreserveHost sends the client's Host header upstream instead of the
+	// target's. ForwardHost sends it as X-Forwarded-Host. Both are off by
+	// default because the value is chosen by the client.
 	PreserveHost bool     `json:"preserveHost,omitempty"`
+	ForwardHost  bool     `json:"forwardHost,omitempty"`
 	Timeout      Duration `json:"timeout,omitempty"`
 	// MaxConcurrent caps in-flight requests to this route (0 = unlimited).
 	MaxConcurrent int `json:"maxConcurrent,omitempty"`
@@ -182,9 +189,10 @@ type ResponseValidation struct {
 type HeaderRules struct {
 	Set    map[string]string `json:"set,omitempty"`
 	Remove []string          `json:"remove,omitempty"`
-	// Allow (response headers only) extends the allowlist of upstream
-	// response headers forwarded to the caller. Upstream headers not on the
-	// built-in list or any applicable Allow list are dropped.
+	// Allow extends the allowlist of headers forwarded: client headers sent
+	// upstream (requestHeaders) or upstream headers returned to the caller
+	// (responseHeaders). Headers not on the built-in list or any applicable
+	// Allow list are dropped.
 	Allow []string `json:"allow,omitempty"`
 }
 
@@ -356,8 +364,10 @@ func (c *Config) Validate() error {
 				add("routes.%s: invalid upstream target %q", id, t)
 			}
 		}
-		if len(r.RequestHeaders.Allow) > 0 {
-			add("routes.%s: requestHeaders.allow is not supported", id)
+		for _, h := range r.RequestHeaders.Allow {
+			if !validHeaderName(h) {
+				add("routes.%s: invalid requestHeaders.allow entry %q", id, h)
+			}
 		}
 		for _, h := range r.ResponseHeaders.Allow {
 			if !validHeaderName(h) {
@@ -413,6 +423,11 @@ func (c *Config) Validate() error {
 			if err := h.RateLimit.validate(); err != nil {
 				add("routes.%s: %v", id, err)
 			}
+		}
+	}
+	for _, h := range c.Defaults.RequestHeaders.Allow {
+		if !validHeaderName(h) {
+			add("defaults: invalid requestHeaders.allow entry %q", h)
 		}
 	}
 	for _, h := range c.Defaults.ResponseHeaders.Allow {

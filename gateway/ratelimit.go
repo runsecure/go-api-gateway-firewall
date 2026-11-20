@@ -4,6 +4,7 @@ import (
 	"hash/maphash"
 	"math"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -49,7 +50,12 @@ func newRateLimiter(c *RateLimitConfig) *rateLimiter {
 
 // allow consumes a token for key, returning the wait until the next token
 // when the bucket is empty.
-func (rl *rateLimiter) allow(key string) (bool, time.Duration) {
+func (rl *rateLimiter) allow(key string) (bool, time.Duration) { return rl.take(key, true) }
+
+// available reports whether key has a token, without consuming it.
+func (rl *rateLimiter) available(key string) (bool, time.Duration) { return rl.take(key, false) }
+
+func (rl *rateLimiter) take(key string, consume bool) (bool, time.Duration) {
 	s := &rl.shards[maphash.String(rl.seed, key)%rlShards]
 	now := rl.now()
 	s.mu.Lock()
@@ -59,6 +65,9 @@ func (rl *rateLimiter) allow(key string) (bool, time.Duration) {
 	}
 	b, ok := s.buckets[key]
 	if !ok {
+		if !consume {
+			return true, 0
+		}
 		b = &bucket{tokens: rl.burst, last: now}
 		s.buckets[key] = b
 	} else {
@@ -66,7 +75,9 @@ func (rl *rateLimiter) allow(key string) (bool, time.Duration) {
 		b.last = now
 	}
 	if b.tokens >= 1 {
-		b.tokens--
+		if consume {
+			b.tokens--
+		}
 		return true, 0
 	}
 	return false, time.Duration((1 - b.tokens) / rl.rate * float64(time.Second))
@@ -93,14 +104,32 @@ func (rl *rateLimiter) middleware(next http.Handler) http.Handler {
 			}
 		}
 		if key == "" {
-			key = "ip:" + ClientIPFrom(r.Context())
+			key = ipRateKey(r)
 		}
 		if ok, wait := rl.allow(key); !ok {
-			secs := int(math.Ceil(wait.Seconds()))
-			w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
-			WriteProblem(w, r, http.StatusTooManyRequests, "rate limit exceeded")
+			rl.reject(w, r, wait)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (rl *rateLimiter) reject(w http.ResponseWriter, r *http.Request, wait time.Duration) {
+	secs := int(math.Ceil(wait.Seconds()))
+	w.Header().Set("Retry-After", strconv.Itoa(max(secs, 1)))
+	WriteProblem(w, r, http.StatusTooManyRequests, "rate limit exceeded")
+}
+
+// ipRateKey is the bucket key for the request's client address. An IPv6
+// client is keyed by its /64: that is the smallest block a network hands to
+// one subscriber, who can otherwise draw a fresh address, and so a fresh
+// bucket, for every request.
+func ipRateKey(r *http.Request) string {
+	ip := ClientIPFrom(r.Context())
+	if a, err := netip.ParseAddr(ip); err == nil && a.Is6() && !a.Is4In6() {
+		if p, err := a.Prefix(64); err == nil {
+			return "ip:" + p.String()
+		}
+	}
+	return "ip:" + ip
 }

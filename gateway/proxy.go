@@ -137,6 +137,7 @@ type routeProxy struct {
 	next         atomic.Uint64
 	tmpl         *pathTemplate
 	preserveHost bool
+	forwardHost  bool
 	upgrades     []string // lower-case protocols clients may upgrade to
 	timeout      time.Duration
 	reqHeaders   headerRules
@@ -241,7 +242,14 @@ func (p *routeProxy) pick() *url.URL {
 }
 
 func (p *routeProxy) rewrite(pr *httputil.ProxyRequest) {
+	// requestHeaderMap reads from everything the client sent; only the
+	// allowlisted headers go upstream under their own names.
 	sourceHeaders := pr.Out.Header.Clone()
+	if dropped := p.reqHeaders.filterUpstream(pr.Out.Header, false); len(dropped) > 0 {
+		ctx := pr.In.Context()
+		p.logger.DebugContext(ctx, "request headers dropped", "route", p.name,
+			"request_id", RequestIDFrom(ctx), "headers", dropped)
+	}
 	if p.tmpl != nil {
 		esc := p.tmpl.render(pr.In)
 		dec, err := url.PathUnescape(esc)
@@ -263,6 +271,11 @@ func (p *routeProxy) rewrite(pr *httputil.ProxyRequest) {
 		pr.Out.Header["X-Forwarded-For"] = xff
 	}
 	pr.SetXForwarded()
+	if !p.forwardHost {
+		// The Host a client sends is whatever it likes; upstreams that build
+		// links from it must not see it unless the route asks for it.
+		pr.Out.Header.Del("X-Forwarded-Host")
+	}
 	if p.respValid != nil {
 		// Let the transport negotiate and transparently decode gzip so the
 		// body can be validated.

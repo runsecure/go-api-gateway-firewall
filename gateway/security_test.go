@@ -3,8 +3,10 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -187,7 +189,7 @@ routes:
     upstream: {targets: [%s]}
 `, testAPIKey, echo.URL, echo.URL, echo.URL))
 
-	spoof := map[string]string{"X-API-Key": testAPIKey, "X-User-Id": "admin", "X-Tenant-Id": "victim", "X-Other": "kept"}
+	spoof := map[string]string{"X-API-Key": testAPIKey, "X-User-Id": "admin", "X-Tenant-Id": "victim", "Accept-Language": "kept"}
 	for target, want := range map[string]map[string]string{
 		"/both":      {"X-User-Id": "alice", "X-Tenant-Id": "k"},
 		"/user-only": {"X-User-Id": "alice", "X-Tenant-Id": ""},
@@ -203,7 +205,7 @@ routes:
 				t.Errorf("%s: %s = %q, want %q", target, h, e.Headers[h], v)
 			}
 		}
-		if e.Headers["X-Other"] != "kept" {
+		if e.Headers["Accept-Language"] != "kept" {
 			t.Errorf("%s: unrelated header dropped", target)
 		}
 	}
@@ -502,5 +504,294 @@ routes:
 		case wantErr != "" && (err == nil || !strings.Contains(err.Error(), wantErr)):
 			t.Errorf("%q: got %v, want error containing %q", statusCodes, err, wantErr)
 		}
+	}
+}
+
+// doFrom is do with a chosen client address.
+func doFrom(t *testing.T, h http.Handler, remoteAddr, target string, hdr map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("GET", target, nil)
+	req.RemoteAddr = remoteAddr
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// A rate limit keyed by principal cannot apply to a caller who never
+// authenticates, so failed attempts are limited per client address, and a
+// client that has used them up is refused before its credentials are checked.
+func TestFailedAuthIsRateLimited(t *testing.T) {
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  k: {type: apikey, options: {keys: {alice: %s}}}
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [k]
+    hardening:
+      rateLimit: {requestsPerSecond: 0.001, burst: 2, key: principal}
+    upstream: {targets: [%s]}
+`, testAPIKey, newEcho(t).URL))
+
+	const attacker, other = "203.0.113.7:1000", "203.0.113.8:1000"
+	bad := map[string]string{"X-API-Key": "wrong-key-wrong-key"}
+	good := map[string]string{"X-API-Key": testAPIKey}
+
+	var codes []int
+	codes = append(codes, doFrom(t, gw, attacker, "/r", bad).Code)
+	codes = append(codes, doFrom(t, gw, attacker, "/r", nil).Code) // no credentials counts too
+	codes = append(codes, doFrom(t, gw, attacker, "/r", bad).Code)
+	codes = append(codes, doFrom(t, gw, attacker, "/r", good).Code) // refused before the key is examined
+	if fmt.Sprint(codes) != "[401 401 429 429]" {
+		t.Fatalf("attacker: %v", codes)
+	}
+	if rec := doFrom(t, gw, attacker, "/r", bad); rec.Header().Get("Retry-After") == "" {
+		t.Error("429 without Retry-After")
+	}
+
+	// Successful requests do not spend the failure budget, and the principal
+	// limit still applies to them.
+	codes = nil
+	for range 3 {
+		codes = append(codes, doFrom(t, gw, other, "/r", good).Code)
+	}
+	if fmt.Sprint(codes) != "[200 200 429]" {
+		t.Fatalf("authenticated: %v", codes)
+	}
+	if rec := doFrom(t, gw, other, "/r", bad); rec.Code != 401 {
+		t.Fatalf("failure budget was spent by successes: %d", rec.Code)
+	}
+}
+
+// An IPv6 client is limited by /64, not by single address.
+func TestRateLimitKeysIPv6ByPrefix(t *testing.T) {
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [anonymous]
+    hardening:
+      rateLimit: {requestsPerSecond: 0.001, burst: 2}
+    upstream: {targets: [%s]}
+`, newEcho(t).URL))
+
+	var codes []int
+	for _, addr := range []string{
+		"[2001:db8:1:1::1]:1000",
+		"[2001:db8:1:1:ffff:ffff:ffff:ffff]:1000",
+		"[2001:db8:1:1:abcd::9]:1000", // same /64: third request
+		"[2001:db8:1:2::1]:1000",      // neighbouring /64
+		"[::ffff:198.51.100.1]:1000",  // IPv4-mapped is IPv4
+		"198.51.100.1:1000",
+		"198.51.100.1:1001",
+		"198.51.100.2:1000", // IPv4 stays per address
+	} {
+		codes = append(codes, doFrom(t, gw, addr, "/r", nil).Code)
+	}
+	if fmt.Sprint(codes) != "[200 200 429 200 200 200 429 200]" {
+		t.Fatalf("codes %v", codes)
+	}
+}
+
+// Client headers reach the upstream only if allowlisted.
+func TestRequestHeaderAllowlist(t *testing.T) {
+	echo := newEcho(t)
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  k: {type: apikey, options: {keys: {alice: %[1]s}}}
+  j: {type: jwt, options: {algorithms: [HS256], secret: %[2]s}}
+defaults:
+  requestHeaders: {allow: [X-Correlation-Id]}
+routes:
+  - name: plain
+    path: /plain
+    methods: [GET, POST]
+    auth: [j, k]
+    forwardIdentity: {X-User-Id: subject}
+    upstream: {targets: [%[3]s]}
+  - name: extra
+    path: /extra
+    methods: [GET]
+    auth: [anonymous]
+    requestHeaders: {allow: [authorization, X-Feature], remove: [User-Agent]}
+    requestHeaderMap: {X-Mapped: X-Unlisted}
+    upstream: {targets: [%[3]s]}
+`, testAPIKey, strings.Repeat("s", 32), echo.URL))
+
+	sent := map[string]string{
+		"Accept":                 "application/json",
+		"Accept-Language":        "en",
+		"User-Agent":             "test-agent",
+		"If-None-Match":          `"abc"`,
+		"X-Correlation-Id":       "corr-1",
+		"X-Feature":              "on",
+		"X-Unlisted":             "u",
+		"Authorization":          "Bearer " + signHS256(t, strings.Repeat("s", 32), map[string]any{"sub": "bob", "exp": 4102444800}),
+		"Cookie":                 "session=1",
+		"X-HTTP-Method-Override": "DELETE",
+		"X-Original-URL":         "/admin",
+		"X-Real-IP":              "10.0.0.1",
+		"X_User_Id":              "admin",
+		"Forwarded":              "for=10.0.0.1",
+		"Traceparent":            "00-abc-def-01",
+	}
+	check := func(target string, want map[string]string, absent ...string) {
+		t.Helper()
+		rec := do(t, gw, "GET", target, "", sent)
+		if rec.Code != 200 {
+			t.Fatalf("%s: %d %s", target, rec.Code, rec.Body)
+		}
+		e := decodeEcho(t, rec)
+		for h, v := range want {
+			if e.Headers[h] != v {
+				t.Errorf("%s: %s = %q, want %q", target, h, e.Headers[h], v)
+			}
+		}
+		for _, h := range absent {
+			if v, ok := e.Headers[h]; ok {
+				t.Errorf("%s: %s reached the upstream (%q)", target, h, v)
+			}
+		}
+		if e.Headers["X-Request-Id"] == "" || e.Headers["X-Forwarded-For"] == "" {
+			t.Errorf("%s: gateway headers missing: %v", target, e.Headers)
+		}
+	}
+	check("/plain",
+		map[string]string{"Accept": "application/json", "Accept-Language": "en", "User-Agent": "test-agent",
+			"If-None-Match": `"abc"`, "X-Correlation-Id": "corr-1", "X-User-Id": "bob"},
+		"Authorization", "Cookie", "X-Http-Method-Override", "X-Original-Url", "X-Real-Ip", "X_user_id",
+		"X_User_Id", "Forwarded", "Traceparent", "X-Feature", "X-Unlisted", "X-Mapped")
+	check("/extra",
+		map[string]string{"Accept": "application/json", "X-Correlation-Id": "corr-1", "X-Feature": "on",
+			"Authorization": sent["Authorization"], "X-Mapped": "u"},
+		"User-Agent", "Cookie", "X-Http-Method-Override", "X-Unlisted", "X_User_Id")
+
+	// Body framing and type survive on a request with a body.
+	rec := do(t, gw, "POST", "/plain", `{"a":1}`, map[string]string{"X-API-Key": testAPIKey})
+	if e := decodeEcho(t, rec); e.Body != `{"a":1}` || e.Headers["Content-Type"] != "application/json" || e.Headers["X-User-Id"] != "alice" {
+		t.Errorf("POST: %d %+v", rec.Code, e)
+	}
+}
+
+// The client's Host is passed upstream only on routes that ask for it.
+func TestHostForwardingIsOptIn(t *testing.T) {
+	echo := newEcho(t)
+	upHost := strings.TrimPrefix(echo.URL, "http://")
+	gw := mustGateway(t, fmt.Sprintf(`
+defaults: {auth: [anonymous]}
+routes:
+  - name: default
+    path: /default
+    methods: [GET]
+    upstream: {targets: [%[1]s]}
+  - name: forward
+    path: /forward
+    methods: [GET]
+    upstream: {targets: [%[1]s], forwardHost: true}
+  - name: preserve
+    path: /preserve
+    methods: [GET]
+    upstream: {targets: [%[1]s], preserveHost: true}
+`, echo.URL))
+
+	for target, want := range map[string][2]string{ // Host, X-Forwarded-Host
+		"/default":  {upHost, ""},
+		"/forward":  {upHost, "evil.example"},
+		"/preserve": {"evil.example", ""},
+	} {
+		req := httptest.NewRequest("GET", target, nil)
+		req.Host = "evil.example"
+		req.Header.Set("X-Forwarded-Host", "spoofed.example")
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		e := decodeEcho(t, rec)
+		if e.Host != want[0] || e.Headers["X-Forwarded-Host"] != want[1] {
+			t.Errorf("%s: Host %q, X-Forwarded-Host %q, want %v", target, e.Host, e.Headers["X-Forwarded-Host"], want)
+		}
+		if e.Headers["X-Forwarded-Proto"] != "http" || e.Headers["X-Forwarded-For"] == "" {
+			t.Errorf("%s: other forwarding headers missing: %v", target, e.Headers)
+		}
+	}
+}
+
+// By default a contract violation is answered exactly like an upstream 400:
+// no schema details, and nothing to tell the two apart.
+func TestValidationErrorsAreGenericByDefault(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream says: field qty is wrong", http.StatusBadRequest)
+	}))
+	defer up.Close()
+	logs := &logCapture{}
+	cfg := func(expose string) string {
+		return fmt.Sprintf(`
+server: {%s}
+defaults: {auth: [anonymous]}
+routes:
+  - name: r
+    path: /r/{id}
+    methods: [POST]
+    upstream: {targets: [%s]}
+    validation:
+      params: {schema: {type: object, properties: {id: {type: string, maxLength: 3}}}}
+      query: {schema: {type: object, additionalProperties: false}}
+      body:
+        schema:
+          type: object
+          required: [qty]
+          properties: {qty: {type: integer, minimum: 1}, card: {type: string, maxLength: 4}}
+`, expose, up.URL)
+	}
+	gw := mustGateway(t, cfg(""), WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+
+	// Normalise the one field that differs per request.
+	shape := func(rec *httptest.ResponseRecorder) string {
+		var p Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+			t.Fatalf("%v: %s", err, rec.Body)
+		}
+		p.RequestID = ""
+		h := rec.Header().Clone()
+		h.Del("X-Request-Id")
+		return fmt.Sprintf("%d %+v %v", rec.Code, p, h)
+	}
+	upstream400 := shape(do(t, gw, "POST", "/r/1", `{"qty":1}`, nil))
+	if !strings.Contains(upstream400, "Detail:bad request") || strings.Contains(upstream400, "upstream says") {
+		t.Fatalf("upstream 400: %s", upstream400)
+	}
+	for name, c := range map[string]struct{ target, body string }{
+		"body schema":    {"/r/1", `{"qty":0,"card":"4111111111111111"}`},
+		"malformed json": {"/r/1", `{"qty":`},
+		"duplicate key":  {"/r/1", `{"qty":1,"qty":2}`},
+		"missing body":   {"/r/1", ``},
+		"query schema":   {"/r/1?debug=1", `{"qty":1}`},
+		"params schema":  {"/r/toolong", `{"qty":1}`},
+	} {
+		req := httptest.NewRequest("POST", c.target, strings.NewReader(c.body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		if got := shape(rec); got != upstream400 {
+			t.Errorf("%s:\n got  %s\n want %s", name, got, upstream400)
+		}
+	}
+	// Operators still learn where it failed, but request values stay out of the log.
+	out := logs.buf.String()
+	if !strings.Contains(out, `"locations":["body:/qty","body:/card"]`) && !strings.Contains(out, `"locations":["body:/card","body:/qty"]`) {
+		t.Errorf("rejection locations not logged:\n%s", out)
+	}
+	if strings.Contains(out, "4111111111111111") {
+		t.Errorf("request value logged:\n%s", out)
+	}
+
+	// Opting in restores the details.
+	gw = mustGateway(t, cfg("exposeValidationErrors: true"))
+	rec := do(t, gw, "POST", "/r/1", `{"qty":0}`, nil)
+	if !strings.Contains(rec.Body.String(), `"location":"/qty"`) {
+		t.Errorf("exposed errors: %s", rec.Body)
 	}
 }

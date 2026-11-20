@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
@@ -76,6 +77,9 @@ type requestValidator struct {
 	maxDepth            int
 	rejectDup           bool
 	expose              bool
+	route               string
+	headers             headerRules // response headers for rejections
+	logger              *slog.Logger
 }
 
 func (v *requestValidator) middleware(next http.Handler) http.Handler {
@@ -93,7 +97,7 @@ func (v *requestValidator) middleware(next http.Handler) http.Handler {
 				if r.URL.RawPath != "" {
 					dec, err := url.PathUnescape(val)
 					if err != nil {
-						WriteProblem(w, r, http.StatusBadRequest, "malformed path parameter")
+						v.refuse(w, r, "malformed path parameter", FieldError{In: "params", Location: "/" + k})
 						return
 					}
 					val = dec
@@ -142,7 +146,7 @@ func (v *requestValidator) validateBody(w http.ResponseWriter, r *http.Request) 
 		if errors.As(err, &mbe) {
 			WriteProblem(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 		} else {
-			WriteProblem(w, r, http.StatusBadRequest, "failed to read request body")
+			v.refuse(w, r, "failed to read request body", FieldError{In: "body"})
 		}
 		return nil, false
 	}
@@ -154,7 +158,7 @@ func (v *requestValidator) validateBody(w http.ResponseWriter, r *http.Request) 
 	if n == 0 {
 		pb.Close()
 		if v.bodyRequired {
-			WriteProblem(w, r, http.StatusBadRequest, "request body is required")
+			v.refuse(w, r, "request body is required", FieldError{In: "body"})
 			return nil, false
 		}
 		r.Body = http.NoBody
@@ -169,8 +173,7 @@ func (v *requestValidator) validateBody(w http.ResponseWriter, r *http.Request) 
 	doc, err := parseJSON(pb.buf.Bytes(), v.maxDepth, v.rejectDup)
 	if err != nil {
 		pb.Close()
-		WriteProblem(w, r, http.StatusBadRequest, "malformed JSON body",
-			FieldError{In: "body", Location: "", Message: err.Error()})
+		v.refuse(w, r, "malformed JSON body", FieldError{In: "body", Location: "", Message: err.Error()})
 		return nil, false
 	}
 	if err := v.body.Validate(doc); err != nil {
@@ -196,11 +199,29 @@ func (v *requestValidator) contentTypeAllowed(ct string) bool {
 }
 
 func (v *requestValidator) reject(w http.ResponseWriter, r *http.Request, in string, err error) {
+	v.refuse(w, r, "request does not match the API contract", schemaErrors(in, err)...)
+}
+
+// refuse answers 400. Unless validation errors are exposed, the response is
+// the one an upstream 400 produces, so the caller learns nothing about the
+// contract or about which side refused. The failing locations are logged;
+// the messages are not, because they can quote the request.
+func (v *requestValidator) refuse(w http.ResponseWriter, r *http.Request, detail string, errs ...FieldError) {
+	if v.logger != nil {
+		where := make([]string, len(errs))
+		for i, e := range errs {
+			where[i] = e.In + ":" + e.Location
+		}
+		ctx := r.Context()
+		v.logger.InfoContext(ctx, "request rejected by contract", "route", v.route,
+			"request_id", RequestIDFrom(ctx), "reason", detail, "locations", where)
+	}
+	v.headers.apply(w.Header())
 	if !v.expose {
-		WriteProblem(w, r, http.StatusBadRequest, "request does not match the API contract")
+		WriteProblem(w, r, http.StatusBadRequest, upstreamErrorDetails[http.StatusBadRequest])
 		return
 	}
-	WriteProblem(w, r, http.StatusBadRequest, "request does not match the API contract", schemaErrors(in, err)...)
+	WriteProblem(w, r, http.StatusBadRequest, detail, errs...)
 }
 
 // schemaErrors flattens a validation error into leaf violations.

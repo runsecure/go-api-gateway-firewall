@@ -99,17 +99,20 @@ routes:
 | `upstream.timeout` | Total upstream deadline (default `defaults.timeout`, then 30s). Returns a generic 502 when exceeded; the timeout is only logged. |
 | `upstream.maxConcurrent` | Maximum in-flight requests. Requests above the cap get the same generic 502 as any other upstream failure; the shed request is only logged. |
 | `upstream.allowUpgrades` | Protocols a client may switch to with `Upgrade`, for example `[websocket]`. Empty by default: the `Upgrade` header is dropped and the request is forwarded as ordinary HTTP. An upgraded connection is a raw tunnel that bypasses validation and response filtering. `h2c` cannot be listed. |
-| `upstream.preserveHost` | Forward the client's `Host` header instead of the target's. |
-| `auth` | Authenticator names to try in order. `[anonymous]` disables auth. |
+| `upstream.preserveHost` | Send the client's `Host` header upstream instead of the target's. Off by default. |
+| `upstream.forwardHost` | Send the client's `Host` upstream as `X-Forwarded-Host`. Off by default. The value is whatever the client chose, so enable either option only for upstreams that need it and do not build links or make trust decisions from it. |
+| `auth` | Authenticator names to try in order. Required, here or in `defaults.auth`: a route with neither is a config error. `[anonymous]` serves the route without authentication. |
 | `requiredScopes` | The principal must have every listed scope, otherwise 403. |
 | `forwardIdentity` | Maps a header name to `subject`, `authenticator`, `scopes` or `claims.<name>`. Client-supplied copies of every header named in any route's `forwardIdentity` are stripped on all routes, including anonymous ones. |
 | `middleware` | Names registered with `WithNamedMiddleware`. |
 | `validation` | `body`, `query`, `params`, `response`. See below. |
 | `hardening` | Per-route overrides of `defaults.hardening`. |
-| `requestHeaders` / `responseHeaders` | `{set: {...}, remove: [...]}`. `responseHeaders` also takes `allow: [...]`, which adds upstream headers to the forwarding allowlist (see Hardening). |
+| `requestHeaders` / `responseHeaders` | `{set: {...}, remove: [...], allow: [...]}`. `allow` adds headers to the forwarding allowlist for that direction (see Hardening). Both can also be set under `defaults`. |
 | `requestHeaderMap` | Maps an upstream header name to an incoming header name, for example `{X-Correlation-Id: X-Request-Id}`. |
 
-Ordinary incoming headers are forwarded by default. `requestHeaderMap` copies all values from the source after authentication and hop-by-hop stripping; if the source is absent, the destination is removed. Mappings use a snapshot, so they do not chain, and `requestHeaders` rules apply afterward. Mapping destinations cannot be hop-by-hop, forwarding, framing, or `forwardIdentity` headers. Client-provided values remain untrusted; do not map them to headers that upstream services treat as authenticated identity.
+Client request headers are **allowlisted**: only the headers listed under Hardening, plus any in `requestHeaders.allow`, are sent upstream. `Authorization` and `Cookie` are not on the list, so an upstream that needs the caller's token must have it allowed explicitly. A header that custom middleware adds for the upstream must be allowed too.
+
+`requestHeaderMap` can read any header the client sent, allowlisted or not. It copies all values from the source after authentication and hop-by-hop stripping; if the source is absent, the destination is removed. Mappings use a snapshot, so they do not chain, and `requestHeaders` rules apply afterward. Mapping destinations cannot be hop-by-hop, forwarding, framing, or `forwardIdentity` headers. Client-provided values remain untrusted; do not map them to headers that upstream services treat as authenticated identity.
 
 ### Validation (API contract)
 
@@ -127,15 +130,21 @@ Each validation entry takes either an inline `schema` or a `file` path (relative
   - A status below 400 that is not listed is replaced with a 502, so list every status the upstream returns on success. Responses without a body (`HEAD`, 204, 304) are exempt. Statuses of 400 and above never reach the caller's body anyway: they are replaced with a gateway-written error.
   - A response with nothing to strip is forwarded byte for byte; otherwise it is re-encoded, which sorts object keys.
 
-A request that violates the contract gets an RFC 9457 `application/problem+json` 400 response:
+A request that violates the contract gets an RFC 9457 `application/problem+json` 400 response. By default it is the same generic response an upstream 400 produces, so a caller learns nothing about the contract and cannot tell which side refused:
+
+```json
+{"title":"Bad Request","status":400,"detail":"bad request","requestId":"a53b60fa38573df0a2c4701f"}
+```
+
+The gateway logs each rejection at info level with the route, request ID and the failing locations (for example `body:/qty`). The messages are not logged, because they can quote values from the request.
+
+Set `server.exposeValidationErrors: true` to return the details to the caller instead, which is useful in development:
 
 ```json
 {"title":"Bad Request","status":400,"detail":"request does not match the API contract",
  "requestId":"a53b60fa38573df0a2c4701f",
  "errors":[{"in":"body","location":"/qty","message":"minimum: got 0, want 1"}]}
 ```
-
-Set `server.exposeValidationErrors: false` to leave out the `errors` details.
 
 ### Hardening
 
@@ -149,11 +158,16 @@ Set `server.exposeValidationErrors: false` to leave out the `errors` details.
 | `allowEncodedSlashes` (`%2F`, `%5C`) | false |
 | `rateLimit: {requestsPerSecond, burst, key: ip\|principal}` | off |
 
+Rate limiting notes:
+- IPv6 clients are limited per `/64`, IPv4 clients per address.
+- With `key: principal`, the limit applies per authenticated caller. Failed authentication attempts get a separate budget of the same size per client address; once it is spent, that address gets 429 without its credentials being checked until the budget refills.
+
 These checks always run, whatever the config:
 - Paths with dot segments, empty segments, backslashes, control characters or double encoding (`%252e`) are rejected **before routing**, as are percent-encoded letters, digits, `-`, `.`, `_` and `~` (`/%61dmin`), which would otherwise slip past the route for `/admin`.
 - Routes are matched byte for byte. If an upstream treats paths case-insensitively or strips `;parameters`, a broad route such as `/api/*` can still reach paths that a narrower route protects; do not rely on a narrower route alone to guard such an upstream.
 - Request bodies are checked for valid UTF-8, nesting depth and trailing data. These are common causes of parser differences between the gateway and an upstream.
-- Inbound `X-Forwarded-*` and `Forwarded` headers are discarded unless the direct peer is in `server.trustedProxies`.
+- Inbound `X-Forwarded-*` and `Forwarded` headers are discarded unless the direct peer is in `server.trustedProxies`. `X-Forwarded-Host` is only sent on routes with `upstream.forwardHost`.
+- Client request headers are **allowlisted**. Only `Accept`, `Accept-Encoding`, `Accept-Language`, `Cache-Control`, `Content-Encoding`, `Content-Language`, `Content-Length`, `Content-Type`, `If-Match`, `If-Modified-Since`, `If-None-Match`, `If-Range`, `If-Unmodified-Since`, `Range` and `User-Agent` are forwarded, plus anything in `requestHeaders.allow` on the defaults or the route. Everything else (for example `Authorization`, `Cookie`, `X-HTTP-Method-Override`, `X-Original-URL`, `X-Real-IP`) is dropped and its name logged at debug level. Headers the gateway adds itself (`X-Request-Id`, `forwardIdentity`, `X-Forwarded-For`/`-Proto`, `requestHeaders.set`, `requestHeaderMap` destinations) are unaffected.
 - Hop-by-hop headers are stripped. Headers the client names in `Connection` are removed on arrival, so they cannot be used to delete headers the gateway adds. The API key header is not forwarded upstream.
 - Upstream response headers are **allowlisted**. Only `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Vary`, `Accept-Ranges` and `Content-Range` are forwarded, plus anything listed in `responseHeaders.allow` on the defaults or the route. Everything else (for example `Set-Cookie`, `Location`, `Link`, `Via`, `Server`, `Server-Timing`) is dropped and its name logged at debug level. A route that relies on cookies or redirects must allow those headers explicitly.
 - Upstream trailers go through the same allowlist. Upstream `1xx` interim responses (such as `103 Early Hints`) are never forwarded. On routes with `upstream.allowUpgrades`, a `101 Switching Protocols` response keeps `Connection`, `Upgrade` and the `Sec-WebSocket-*` headers; on any other route a 101 is replaced with a 502.

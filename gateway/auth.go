@@ -83,9 +83,29 @@ func stripHeaders(names []string) Middleware {
 }
 
 // authMiddleware tries each authenticator in order and enforces scopes.
-func authMiddleware(auths []namedAuth, scopes []string, forward map[string]string, log logFunc) func(http.Handler) http.Handler {
+//
+// failures, when set, limits failed attempts per client address: each 401
+// costs a token, and a client with none left is refused before its
+// credentials are examined. It is used on routes whose rate limit is keyed by
+// principal, which cannot apply until authentication has succeeded.
+func authMiddleware(auths []namedAuth, scopes []string, forward map[string]string, log logFunc, failures *rateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			failKey := ""
+			if failures != nil {
+				failKey = ipRateKey(r)
+				if ok, wait := failures.available(failKey); !ok {
+					failures.reject(w, r, wait)
+					return
+				}
+			}
+			unauthorized := func(detail string) {
+				if failures != nil {
+					failures.allow(failKey)
+				}
+				w.Header().Set("WWW-Authenticate", `Bearer realm="gateway"`)
+				WriteProblem(w, r, http.StatusUnauthorized, detail)
+			}
 			// Never let clients supply identity headers the gateway injects.
 			for h := range forward {
 				r.Header.Del(h)
@@ -98,8 +118,7 @@ func authMiddleware(auths []namedAuth, scopes []string, forward map[string]strin
 				}
 				if err != nil || got == nil {
 					log(r, "authentication failed", "authenticator", na.name, "error", err)
-					w.Header().Set("WWW-Authenticate", `Bearer realm="gateway"`)
-					WriteProblem(w, r, http.StatusUnauthorized, "invalid credentials")
+					unauthorized("invalid credentials")
 					return
 				}
 				if got.Authenticator == "" {
@@ -109,8 +128,7 @@ func authMiddleware(auths []namedAuth, scopes []string, forward map[string]strin
 				break
 			}
 			if p == nil {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="gateway"`)
-				WriteProblem(w, r, http.StatusUnauthorized, "authentication required")
+				unauthorized("authentication required")
 				return
 			}
 			// Recorded before the scope check so 403s show who was refused.

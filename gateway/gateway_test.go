@@ -159,6 +159,7 @@ func baseConfig(upstream string) string {
 	return fmt.Sprintf(`
 server:
   healthPath: /healthz
+  exposeValidationErrors: true
 defaults:
   auth: [anonymous]
   hardening:
@@ -446,6 +447,7 @@ routes:
     methods: [GET]
     auth: [hdr]
     middleware: [tag]
+    requestHeaders: {allow: [X-Tag]}
     upstream: {targets: [%s]}
 `, up.URL),
 		WithAuthenticatorType("header-token", func(name string, raw json.RawMessage) (Authenticator, error) {
@@ -1048,7 +1050,10 @@ func TestConfigErrors(t *testing.T) {
 		"log custom apikey":  "server: {logHeaders: [X-Partner-Key]}\nauthenticators: {p: {type: apikey, options: {header: x-partner-key, keys: {a: k}}}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
 		"log custom jwt":     "server: {logHeaders: [X-Token]}\nauthenticators: {j: {type: jwt, options: {header: X-Token}}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
 		"log bad name":       "server: {logHeaders: ['a b']}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
-		"request allow":      "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}, requestHeaders: {allow: [X-A]}}]",
+		"bad request allow":  "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}, requestHeaders: {allow: ['bad header']}}]",
+		"bad default req":    "defaults: {requestHeaders: {allow: ['a:b']}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"no auth":            "routes: [{name: a, path: /a, methods: [GET], upstream: {targets: [http://x]}}]",
+		"empty auth":         "routes: [{name: a, path: /a, methods: [GET], auth: [], upstream: {targets: [http://x]}}]",
 		"bad allow name":     "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}, responseHeaders: {allow: ['bad header']}}]",
 		"bad default allow":  "defaults: {responseHeaders: {allow: ['a:b']}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
 	}

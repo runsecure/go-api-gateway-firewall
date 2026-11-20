@@ -153,8 +153,9 @@ func compileHeaderRules(rules ...HeaderRules) headerRules {
 }
 
 // filterUpstream deletes every header in h that is not allowlisted and
-// returns the names removed. A 101 response also keeps the headers needed to
-// complete the protocol switch.
+// returns the names removed. It serves both directions: client headers on
+// the way upstream and upstream headers on the way back. A 101 response also
+// keeps the headers needed to complete the protocol switch.
 func (hr headerRules) filterUpstream(h http.Header, switching bool) []string {
 	var dropped []string
 	for k := range h {
@@ -199,6 +200,40 @@ func (p *routeProxy) concurrencyLimit(max int) func(http.Handler) http.Handler {
 			}
 		})
 	}
+}
+
+// defaultRequestHeaders are the client request headers forwarded upstream on
+// every route. Everything else a client sends is dropped unless a route or
+// the defaults add it with requestHeaders.allow. Credentials (Authorization,
+// Cookie) are deliberately absent: the gateway authenticates the caller and
+// passes identity on with forwardIdentity.
+var defaultRequestHeaders = HeaderRules{Allow: []string{
+	"Accept",
+	"Accept-Encoding",
+	"Accept-Language",
+	"Cache-Control",
+	"Content-Encoding",
+	"Content-Language",
+	"Content-Length",
+	"Content-Type",
+	"If-Match",
+	"If-Modified-Since",
+	"If-None-Match",
+	"If-Range",
+	"If-Unmodified-Since",
+	"Range",
+	"User-Agent",
+}}
+
+// upgradeRequestHeaders are also forwarded on routes with allowUpgrades, so
+// a protocol switch can be negotiated.
+var upgradeRequestHeaders = map[string]bool{
+	"Connection":               true,
+	"Upgrade":                  true,
+	"Sec-Websocket-Key":        true,
+	"Sec-Websocket-Version":    true,
+	"Sec-Websocket-Protocol":   true,
+	"Sec-Websocket-Extensions": true,
 }
 
 // defaultAllowedResponseHeaders are the upstream response headers forwarded

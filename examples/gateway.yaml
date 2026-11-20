@@ -9,7 +9,7 @@ server:
   maxHeaderBytes: 32768
   healthPath: /healthz
   trustedProxies: [10.0.0.0/8]   # load balancer ranges allowed to set X-Forwarded-For
-  exposeValidationErrors: true
+  exposeValidationErrors: false   # true returns schema error details to callers; for development only
   logHeaders: [X-True-Ip, Traceparent, X-Correlation-Id]   # extra inbound headers in the access log
 
 defaults:

@@ -67,7 +67,9 @@ func WithAuthenticatorType(typ string, f AuthenticatorFactory) Option {
 	return func(o *options) { o.authTypes[typ] = f }
 }
 
-// WithNamedMiddleware registers middleware routes can opt into by name.
+// WithNamedMiddleware registers middleware routes can opt into by name. A
+// request header the middleware adds for the upstream must be listed in the
+// route's requestHeaders.allow, like any other forwarded header.
 func WithNamedMiddleware(name string, m Middleware) Option {
 	return func(o *options) { o.named[name] = m }
 }
@@ -213,8 +215,9 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 	p := &routeProxy{
 		name:         rc.Name,
 		preserveHost: rc.Upstream.PreserveHost,
+		forwardHost:  rc.Upstream.ForwardHost,
 		timeout:      rc.Upstream.Timeout.D(),
-		reqHeaders:   compileHeaderRules(rc.RequestHeaders),
+		reqHeaders:   compileHeaderRules(defaultRequestHeaders, cfg.Defaults.RequestHeaders, rc.RequestHeaders),
 		reqHeaderMap: rc.RequestHeaderMap,
 		respHeaders:  compileHeaderRules(defaultResponseHeaders, cfg.Defaults.ResponseHeaders, rc.ResponseHeaders),
 		ips:          ips,
@@ -222,6 +225,16 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 	}
 	for _, proto := range rc.Upstream.AllowUpgrades {
 		p.upgrades = append(p.upgrades, strings.ToLower(proto))
+	}
+	// Headers the gateway itself puts on the request pass the allowlist.
+	p.reqHeaders.allow[RequestIDHeader] = true
+	for hdr := range rc.ForwardHeaders {
+		p.reqHeaders.allow[http.CanonicalHeaderKey(hdr)] = true
+	}
+	if len(p.upgrades) > 0 {
+		for hdr := range upgradeRequestHeaders {
+			p.reqHeaders.allow[hdr] = true
+		}
 	}
 	if p.timeout == 0 {
 		p.timeout = cfg.Defaults.Timeout.D()
@@ -252,7 +265,10 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 		maxBody:   h.MaxBodyBytes,
 		maxDepth:  h.MaxJSONDepth,
 		rejectDup: boolOr(h.RejectDuplicateKeys, true),
-		expose:    boolOr(cfg.Server.ExposeValidationErrors, true),
+		expose:    boolOr(cfg.Server.ExposeValidationErrors, false),
+		route:     rc.Name,
+		headers:   p.respHeaders,
+		logger:    g.logger,
 	}
 	v := rc.Validation
 	if rv.params, err = sc.compile(v.Params, rc.Name, "params"); err != nil {
@@ -302,7 +318,10 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 	}
 
 	names := rc.authNames(cfg.Defaults.Auth)
-	anonymous := len(names) == 0 || slices.Contains(names, AnonymousAuth)
+	if len(names) == 0 {
+		return fail("auth is required: list authenticators here or in defaults.auth, or use [%s] to serve the route without authentication", AnonymousAuth)
+	}
+	anonymous := slices.Contains(names, AnonymousAuth)
 	if anonymous && len(names) > 1 {
 		return fail("%q cannot be combined with other authenticators", AnonymousAuth)
 	}
@@ -325,9 +344,13 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 			}
 			fwd[http.CanonicalHeaderKey(hdr)] = src
 		}
-		chain = append(chain, authMiddleware(list, rc.RequiredScopes, fwd, g.authLog))
-	} else if len(cfg.Defaults.Auth) == 0 && len(rc.Auth) == 0 {
-		g.logger.Warn("route has no authentication configured", "route", rc.Name)
+		// A limit keyed by principal only applies once authentication has
+		// succeeded, so failed attempts get their own per-address budget.
+		var failures *rateLimiter
+		if rl != nil && rl.byUser {
+			failures = newRateLimiter(h.RateLimit)
+		}
+		chain = append(chain, authMiddleware(list, rc.RequiredScopes, fwd, g.authLog, failures))
 	}
 	if rl != nil && rl.byUser {
 		chain = append(chain, rl.middleware)
