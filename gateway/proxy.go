@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -136,6 +137,7 @@ type routeProxy struct {
 	next         atomic.Uint64
 	tmpl         *pathTemplate
 	preserveHost bool
+	upgrades     []string // lower-case protocols clients may upgrade to
 	timeout      time.Duration
 	reqHeaders   headerRules
 	reqHeaderMap map[string]string
@@ -162,6 +164,11 @@ func (p *routeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 		defer cancel()
 		r = r.WithContext(ctx)
+	}
+	// An upgraded connection is a raw tunnel to the upstream. Without the
+	// Upgrade header ReverseProxy forwards an ordinary request.
+	if up := r.Header.Get("Upgrade"); up != "" && !p.upgradeAllowed(up) {
+		r.Header.Del("Upgrade")
 	}
 	p.rp.ServeHTTP(&interimSuppressor{ResponseWriter: w, saved: w.Header().Clone()}, r)
 }
@@ -216,6 +223,15 @@ func (w *interimSuppressor) Write(b []byte) (int, error) {
 }
 
 func (w *interimSuppressor) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// upgradeAllowed reports whether the route permits switching to proto.
+func (p *routeProxy) upgradeAllowed(proto string) bool {
+	return slices.Contains(p.upgrades, strings.ToLower(proto))
+}
+
+// errUpgradeRefused rejects a 101 the route did not opt into, in case an
+// upstream switches protocols without having been asked to.
+var errUpgradeRefused = errors.New("upstream switched protocols on a route that does not allow it")
 
 func (p *routeProxy) pick() *url.URL {
 	if len(p.targets) == 1 {
@@ -335,6 +351,9 @@ func (p *routeProxy) modifyResponse(resp *http.Response) error {
 	requestLogFrom(resp.Request.Context()).setUpstreamStatus(resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return &upstreamStatusError{status: resp.StatusCode}
+	}
+	if resp.StatusCode == http.StatusSwitchingProtocols && !p.upgradeAllowed(resp.Header.Get("Upgrade")) {
+		return errUpgradeRefused
 	}
 	if p.respValid != nil {
 		stripped, err := p.respValid.check(resp)

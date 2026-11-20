@@ -230,6 +230,7 @@ func entryMiddleware(logger *slog.Logger, ips *clientIPResolver, accessLog bool,
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			logged := capturedHeaders(r.Header, logHeaders)
+			dropNominatedHeaders(r.Header)
 			id := r.Header.Get(RequestIDHeader)
 			if !validRequestID(id) {
 				id = newRequestID()
@@ -302,6 +303,36 @@ func entryMiddleware(logger *slog.Logger, ips *clientIPResolver, accessLog bool,
 			}()
 			next.ServeHTTP(rec, r)
 		})
+	}
+}
+
+// dropNominatedHeaders removes the headers the client listed in Connection,
+// leaving only the Upgrade token. ReverseProxy removes these headers too, but
+// only when it forwards the request, by which time the gateway has added its
+// own (request ID, forwarded identity); a client could otherwise name one of
+// those in Connection to have it deleted on the way upstream.
+func dropNominatedHeaders(h http.Header) {
+	conn := h["Connection"]
+	if len(conn) == 0 {
+		return
+	}
+	upgrade := false
+	for _, line := range conn {
+		for tok := range strings.SplitSeq(line, ",") {
+			tok = strings.TrimSpace(tok)
+			switch {
+			case tok == "":
+			case strings.EqualFold(tok, "Upgrade"):
+				upgrade = true
+			default:
+				h.Del(tok)
+			}
+		}
+	}
+	if upgrade {
+		h["Connection"] = []string{"Upgrade"}
+	} else {
+		delete(h, "Connection")
 	}
 }
 

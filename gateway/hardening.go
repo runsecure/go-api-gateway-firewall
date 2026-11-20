@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -12,7 +13,11 @@ import (
 // no route ever matches a path an upstream might interpret differently.
 func pathGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if reason := unsafePath(r.URL.Path); reason != "" {
+		reason := unsafePath(r.URL.Path)
+		if reason == "" {
+			reason = unsafeRawPath(r.URL.RawPath)
+		}
+		if reason != "" {
 			WriteProblem(w, r, http.StatusBadRequest, reason)
 			return
 		}
@@ -50,6 +55,30 @@ func unsafePath(p string) string {
 				return "double-encoded path"
 			}
 		}
+	}
+	return ""
+}
+
+// unsafeRawPath rejects percent-encoded unreserved characters (letters,
+// digits, "-", ".", "_", "~"). RFC 3986 makes "%61" and "a" equivalent, and
+// upstreams decode them, but routes are matched on the path as sent, so
+// "/%61dmin" would miss a route for "/admin" and fall through to a broader
+// one. raw is empty when the path was sent in canonical form.
+func unsafeRawPath(raw string) string {
+	for i := 0; i+2 < len(raw); i++ {
+		if raw[i] != '%' {
+			continue
+		}
+		b, err := strconv.ParseUint(raw[i+1:i+3], 16, 8)
+		if err != nil {
+			continue
+		}
+		c := byte(b)
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
+			c == '-' || c == '.' || c == '_' || c == '~' {
+			return "unnecessarily encoded character in path"
+		}
+		i += 2
 	}
 	return ""
 }
@@ -190,7 +219,7 @@ var defaultAllowedResponseHeaders = []string{
 }
 
 // switchingProtocolHeaders are kept on a 101 response so protocol upgrades
-// (WebSocket, h2c) can complete.
+// (WebSocket) can complete on routes that allow them.
 var switchingProtocolHeaders = map[string]bool{
 	"Connection":               true,
 	"Upgrade":                  true,

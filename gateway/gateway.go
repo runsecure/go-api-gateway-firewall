@@ -117,6 +117,19 @@ func New(cfg *Config, opts ...Option) (*Gateway, error) {
 
 	g := &Gateway{cfg: cfg, mux: chi.NewMux(), logger: o.logger, registered: map[string]string{}}
 	g.mux.Use(entryMiddleware(o.logger, ips, boolOr(cfg.Server.AccessLog, true), cfg.Server.LogHeaders), pathGuard)
+	// Identity headers are stripped on every route, not only the ones that
+	// inject them: routes usually share upstreams, and an upstream cannot tell
+	// which route a header arrived through.
+	var identity []string
+	for _, rc := range cfg.Routes {
+		for h := range rc.ForwardHeaders {
+			identity = append(identity, http.CanonicalHeaderKey(h))
+		}
+	}
+	if len(identity) > 0 {
+		slices.Sort(identity)
+		g.mux.Use(stripHeaders(slices.Compact(identity)))
+	}
 	g.mux.Use(o.global...)
 
 	globalResp := compileHeaderRules(defaultResponseHeaders, cfg.Defaults.ResponseHeaders)
@@ -206,6 +219,9 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 		respHeaders:  compileHeaderRules(defaultResponseHeaders, cfg.Defaults.ResponseHeaders, rc.ResponseHeaders),
 		ips:          ips,
 		logger:       g.logger,
+	}
+	for _, proto := range rc.Upstream.AllowUpgrades {
+		p.upgrades = append(p.upgrades, strings.ToLower(proto))
 	}
 	if p.timeout == 0 {
 		p.timeout = cfg.Defaults.Timeout.D()

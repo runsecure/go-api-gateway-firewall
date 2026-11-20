@@ -85,9 +85,21 @@ func (v *requestValidator) middleware(next http.Handler) http.Handler {
 			rc := chi.RouteContext(r.Context())
 			m := make(map[string]any, len(rc.URLParams.Keys))
 			for i, k := range rc.URLParams.Keys {
-				if k != "*" {
-					m[k] = rc.URLParams.Values[i]
+				if k == "*" {
+					continue
 				}
+				// chi yields escaped values when the request has a RawPath;
+				// validate what the upstream will see after decoding.
+				val := rc.URLParams.Values[i]
+				if r.URL.RawPath != "" {
+					dec, err := url.PathUnescape(val)
+					if err != nil {
+						WriteProblem(w, r, http.StatusBadRequest, "malformed path parameter")
+						return
+					}
+					val = dec
+				}
+				m[k] = val
 			}
 			if err := v.params.Validate(m); err != nil {
 				v.reject(w, r, "params", err)

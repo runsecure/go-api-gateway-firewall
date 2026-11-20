@@ -98,10 +98,11 @@ routes:
 | `upstream.path` | Optional rewrite template. `{name}` inserts a route param and `{*}` inserts the wildcard remainder. If omitted, the inbound path is forwarded unchanged. |
 | `upstream.timeout` | Total upstream deadline (default `defaults.timeout`, then 30s). Returns a generic 502 when exceeded; the timeout is only logged. |
 | `upstream.maxConcurrent` | Maximum in-flight requests. Requests above the cap get the same generic 502 as any other upstream failure; the shed request is only logged. |
+| `upstream.allowUpgrades` | Protocols a client may switch to with `Upgrade`, for example `[websocket]`. Empty by default: the `Upgrade` header is dropped and the request is forwarded as ordinary HTTP. An upgraded connection is a raw tunnel that bypasses validation and response filtering. `h2c` cannot be listed. |
 | `upstream.preserveHost` | Forward the client's `Host` header instead of the target's. |
 | `auth` | Authenticator names to try in order. `[anonymous]` disables auth. |
 | `requiredScopes` | The principal must have every listed scope, otherwise 403. |
-| `forwardIdentity` | Maps a header name to `subject`, `authenticator`, `scopes` or `claims.<name>`. Any client-supplied copies of these headers are always stripped. |
+| `forwardIdentity` | Maps a header name to `subject`, `authenticator`, `scopes` or `claims.<name>`. Client-supplied copies of every header named in any route's `forwardIdentity` are stripped on all routes, including anonymous ones. |
 | `middleware` | Names registered with `WithNamedMiddleware`. |
 | `validation` | `body`, `query`, `params`, `response`. See below. |
 | `hardening` | Per-route overrides of `defaults.hardening`. |
@@ -147,12 +148,13 @@ Set `server.exposeValidationErrors: false` to leave out the `errors` details.
 | `rateLimit: {requestsPerSecond, burst, key: ip\|principal}` | off |
 
 These checks always run, whatever the config:
-- Paths with dot segments, empty segments, backslashes, control characters or double encoding (`%252e`) are rejected **before routing**.
+- Paths with dot segments, empty segments, backslashes, control characters or double encoding (`%252e`) are rejected **before routing**, as are percent-encoded letters, digits, `-`, `.`, `_` and `~` (`/%61dmin`), which would otherwise slip past the route for `/admin`.
+- Routes are matched byte for byte. If an upstream treats paths case-insensitively or strips `;parameters`, a broad route such as `/api/*` can still reach paths that a narrower route protects; do not rely on a narrower route alone to guard such an upstream.
 - Request bodies are checked for valid UTF-8, nesting depth and trailing data. These are common causes of parser differences between the gateway and an upstream.
 - Inbound `X-Forwarded-*` and `Forwarded` headers are discarded unless the direct peer is in `server.trustedProxies`.
-- Hop-by-hop headers are stripped. The API key header is not forwarded upstream.
+- Hop-by-hop headers are stripped. Headers the client names in `Connection` are removed on arrival, so they cannot be used to delete headers the gateway adds. The API key header is not forwarded upstream.
 - Upstream response headers are **allowlisted**. Only `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Vary`, `Accept-Ranges` and `Content-Range` are forwarded, plus anything listed in `responseHeaders.allow` on the defaults or the route. Everything else (for example `Set-Cookie`, `Location`, `Link`, `Via`, `Server`, `Server-Timing`) is dropped and its name logged at debug level. A route that relies on cookies or redirects must allow those headers explicitly.
-- Upstream trailers go through the same allowlist. Upstream `1xx` interim responses (such as `103 Early Hints`) are never forwarded. A `101 Switching Protocols` response keeps `Connection`, `Upgrade` and the `Sec-WebSocket-*` headers so upgrades still work.
+- Upstream trailers go through the same allowlist. Upstream `1xx` interim responses (such as `103 Early Hints`) are never forwarded. On routes with `upstream.allowUpgrades`, a `101 Switching Protocols` response keeps `Connection`, `Upgrade` and the `Sec-WebSocket-*` headers; on any other route a 101 is replaced with a 502.
 - `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer` are added to every response, overriding upstream values.
 - Every request gets an `X-Request-Id`. A client-supplied ID is kept only if it is 64 characters or fewer and uses only safe characters.
 - Server read, header and idle timeouts and `maxHeaderBytes` all have safe defaults.

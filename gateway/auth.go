@@ -70,6 +70,18 @@ type namedAuth struct {
 	a    Authenticator
 }
 
+// stripHeaders deletes the named (canonical) headers from every request.
+func stripHeaders(names []string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for _, h := range names {
+				delete(r.Header, h)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // authMiddleware tries each authenticator in order and enforces scopes.
 func authMiddleware(auths []namedAuth, scopes []string, forward map[string]string, log logFunc) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

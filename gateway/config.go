@@ -133,6 +133,11 @@ type UpstreamConfig struct {
 	Timeout      Duration `json:"timeout,omitempty"`
 	// MaxConcurrent caps in-flight requests to this route (0 = unlimited).
 	MaxConcurrent int `json:"maxConcurrent,omitempty"`
+	// AllowUpgrades lists the protocols a client may switch to with an
+	// Upgrade request, e.g. ["websocket"]. An upgraded connection is a raw
+	// tunnel to the upstream that bypasses validation, so it is off unless
+	// listed here. "h2c" can never be listed.
+	AllowUpgrades []string `json:"allowUpgrades,omitempty"`
 }
 
 // ValidationConfig declares the API contract enforced for a route.
@@ -354,6 +359,14 @@ func (c *Config) Validate() error {
 		for _, h := range r.ResponseHeaders.Allow {
 			if !validHeaderName(h) {
 				add("routes.%s: invalid responseHeaders.allow entry %q", id, h)
+			}
+		}
+		for _, proto := range r.Upstream.AllowUpgrades {
+			switch {
+			case !validHeaderName(proto):
+				add("routes.%s: invalid upstream.allowUpgrades entry %q", id, proto)
+			case strings.EqualFold(proto, "h2c"):
+				add("routes.%s: upstream.allowUpgrades cannot include h2c", id)
 			}
 		}
 		if r.Upstream.MaxConcurrent < 0 {
