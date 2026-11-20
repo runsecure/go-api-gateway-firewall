@@ -493,6 +493,55 @@ routes:
 	}
 }
 
+func TestConcurrencyLimitIsIndistinguishable(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		entered <- struct{}{}
+		<-release
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: r
+    path: /{p}
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s], maxConcurrent: 1}
+`, up.URL))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		do(t, gw, "GET", "/hold", "", nil)
+	}()
+	<-entered
+	shed := do(t, gw, "GET", "/hold", "", nil)
+	close(release)
+	<-done
+	failed := do(t, gw, "GET", "/fail", "", nil)
+
+	if shed.Code != 502 || shed.Header().Get("Retry-After") != "" {
+		t.Fatalf("shed request: %d retry-after=%q %s", shed.Code, shed.Header().Get("Retry-After"), shed.Body)
+	}
+	strip := func(rec *httptest.ResponseRecorder) (Problem, http.Header) {
+		var p Problem
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		p.RequestID = ""
+		h := rec.Header().Clone()
+		h.Del("X-Request-Id")
+		return p, h
+	}
+	sp, sh := strip(shed)
+	fp, fh := strip(failed)
+	if fmt.Sprint(sp) != fmt.Sprint(fp) || fmt.Sprint(sh) != fmt.Sprint(fh) {
+		t.Fatalf("shed and upstream-failure responses differ:\n%v %v\n%v %v", sp, sh, fp, fh)
+	}
+}
+
 func TestResponseValidation(t *testing.T) {
 	var body string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

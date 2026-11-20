@@ -282,7 +282,7 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 		}
 	}
 	if n := rc.Upstream.MaxConcurrent; n > 0 {
-		chain = append(chain, concurrencyLimit(n))
+		chain = append(chain, p.concurrencyLimit(n))
 	}
 
 	names := rc.authNames(cfg.Defaults.Auth)

@@ -326,6 +326,13 @@ func (p *routeProxy) errorHandler(w http.ResponseWriter, r *http.Request, err er
 		p.logger.WarnContext(ctx, "upstream error", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
 	}
+	p.writeUpstreamError(w, r, status)
+}
+
+// writeUpstreamError answers with the external status and detail mapped from
+// an internal upstream status. Every upstream failure goes through here so
+// the responses are identical whatever the cause.
+func (p *routeProxy) writeUpstreamError(w http.ResponseWriter, r *http.Request, status int) {
 	external := mapUpstreamStatus(status)
 	p.respHeaders.apply(w.Header())
 	WriteProblem(w, r, external, upstreamErrorDetails[external])

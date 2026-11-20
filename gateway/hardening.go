@@ -126,8 +126,10 @@ func (hr headerRules) apply(h http.Header) {
 	}
 }
 
-// concurrencyLimit sheds load once max requests are in flight.
-func concurrencyLimit(max int) func(http.Handler) http.Handler {
+// concurrencyLimit sheds load once max requests are in flight. A shed
+// request is logged and answered exactly like any other upstream failure, so
+// the caller cannot tell that the route is saturated.
+func (p *routeProxy) concurrencyLimit(max int) func(http.Handler) http.Handler {
 	sem := make(chan struct{}, max)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -136,8 +138,10 @@ func concurrencyLimit(max int) func(http.Handler) http.Handler {
 				defer func() { <-sem }()
 				next.ServeHTTP(w, r)
 			default:
-				w.Header().Set("Retry-After", "1")
-				WriteProblem(w, r, http.StatusServiceUnavailable, "upstream at capacity")
+				ctx := r.Context()
+				p.logger.WarnContext(ctx, "route at concurrency limit", "route", p.name,
+					"request_id", RequestIDFrom(ctx), "max_concurrent", max)
+				p.writeUpstreamError(w, r, http.StatusServiceUnavailable)
 			}
 		})
 	}

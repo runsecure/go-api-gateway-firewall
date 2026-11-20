@@ -69,7 +69,7 @@ routes:
 | `upstream.targets` | One or more `http(s)` base URLs, balanced round-robin. |
 | `upstream.path` | Optional rewrite template. `{name}` inserts a route param and `{*}` inserts the wildcard remainder. If omitted, the inbound path is forwarded unchanged. |
 | `upstream.timeout` | Total upstream deadline (default `defaults.timeout`, then 30s). Returns a generic 502 when exceeded; the timeout is only logged. |
-| `upstream.maxConcurrent` | Maximum in-flight requests. Requests above the cap get 503 with `Retry-After`. |
+| `upstream.maxConcurrent` | Maximum in-flight requests. Requests above the cap get the same generic 502 as any other upstream failure; the shed request is only logged. |
 | `upstream.preserveHost` | Forward the client's `Host` header instead of the target's. |
 | `auth` | Authenticator names to try in order. `[anonymous]` disables auth. |
 | `requiredScopes` | The principal must have every listed scope, otherwise 403. |
