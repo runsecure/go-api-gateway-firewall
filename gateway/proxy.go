@@ -284,8 +284,14 @@ func (p *routeProxy) modifyResponse(resp *http.Response) error {
 		return &upstreamStatusError{status: resp.StatusCode}
 	}
 	if p.respValid != nil {
-		if err := p.respValid.check(resp); err != nil {
+		stripped, err := p.respValid.check(resp)
+		if err != nil {
 			return err
+		}
+		if stripped > 0 {
+			ctx := resp.Request.Context()
+			p.logger.DebugContext(ctx, "undeclared response properties stripped", "route", p.name,
+				"request_id", RequestIDFrom(ctx), "count", stripped)
 		}
 	}
 	p.respHeaders.apply(resp.Header)

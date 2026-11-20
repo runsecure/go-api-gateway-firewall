@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -270,10 +271,13 @@ func (p *pooledBody) Close() error {
 }
 
 // responseValidator enforces the response contract via ModifyResponse.
+// Properties the schema does not declare are stripped; a response that still
+// violates the schema afterwards is rejected.
 type responseValidator struct {
 	schema   *jsonschema.Schema
 	statuses []int
 	maxBytes int64
+	filter   responseFilter
 }
 
 var errResponseContract = errors.New("upstream response violates contract")
@@ -285,36 +289,50 @@ func (v *responseValidator) applies(status int) bool {
 	return slices.Contains(v.statuses, status)
 }
 
-func (v *responseValidator) check(resp *http.Response) error {
+// check filters and validates the response body, returning the number of
+// undeclared properties stripped from it.
+func (v *responseValidator) check(resp *http.Response) (stripped int, err error) {
 	if !v.applies(resp.StatusCode) || resp.Request.Method == http.MethodHead ||
 		resp.StatusCode == http.StatusNoContent {
-		return nil
+		return 0, nil
 	}
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
-		return fmt.Errorf("%w: cannot validate encoded response (%s)", errResponseContract, ce)
+		return 0, fmt.Errorf("%w: cannot validate encoded response (%s)", errResponseContract, ce)
 	}
 	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if mt != "application/json" && !strings.HasSuffix(mt, "+json") {
-		return fmt.Errorf("%w: unexpected content type %q", errResponseContract, mt)
+		return 0, fmt.Errorf("%w: unexpected content type %q", errResponseContract, mt)
 	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, v.maxBytes+1))
 	_ = resp.Body.Close()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if int64(len(b)) > v.maxBytes {
-		return fmt.Errorf("%w: response exceeds %d bytes", errResponseContract, v.maxBytes)
+		return 0, fmt.Errorf("%w: response exceeds %d bytes", errResponseContract, v.maxBytes)
 	}
 	doc, err := parseJSON(b, 512, false)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errResponseContract, err)
+		return 0, fmt.Errorf("%w: %v", errResponseContract, err)
 	}
+	stripped = v.filter.filter(v.schema, doc)
 	if err := v.schema.Validate(doc); err != nil {
-		return fmt.Errorf("%w: %v", errResponseContract, err)
+		return 0, fmt.Errorf("%w: %v", errResponseContract, err)
+	}
+	if stripped > 0 {
+		// Re-encode only when something was removed, so conforming
+		// responses are forwarded byte for byte.
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(doc); err != nil {
+			return 0, fmt.Errorf("%w: %v", errResponseContract, err)
+		}
+		b = bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(b))
 	resp.ContentLength = int64(len(b))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(b)))
 	resp.TransferEncoding = nil
-	return nil
+	return stripped, nil
 }

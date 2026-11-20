@@ -142,8 +142,9 @@ type BodyValidation struct {
 	ContentTypes []string `json:"contentTypes,omitempty"`
 }
 
-// ResponseValidation validates upstream JSON responses. Responses that fail
-// are replaced with 502 so contract violations never reach clients.
+// ResponseValidation filters and validates upstream JSON responses.
+// Properties the schema does not declare are stripped before the response is
+// forwarded; a response that still violates the schema is replaced with 502.
 type ResponseValidation struct {
 	SchemaRef
 	// StatusCodes to validate; defaults to all 2xx.

@@ -5,7 +5,7 @@ A lightweight, configuration-driven API gateway for Go, built on [chi](https://g
 You can use it as a **library** (`gateway` package) inside your own Go program, or as a **ready-made executable** (`cmd/gateway`).
 
 - **Reverse proxy routing.** Uses chi route patterns (`/orders/{id}`, `/static/*`), upstream path templates, round-robin across targets, per-route timeouts and concurrency caps.
-- **Per-route JSON Schema validation (draft 2020-12).** Checks the request body, query string and path params, plus optional **response** validation so upstream data leaks are blocked with a 502.
+- **Per-route JSON Schema validation (draft 2020-12).** Checks the request body, query string and path params, plus optional **response** filtering so fields the schema does not declare are stripped before they reach the caller.
 - **Pluggable authentication.** Ships with JWT (HS/RS/PS/ES) and API-key authenticators. You can register your own types and refer to them from config.
 - **Request hardening.** Body/URL/query limits, JSON depth limits, rejection of duplicate keys and invalid UTF-8, path traversal and double-encoding guards, rate limiting, header sanitization and security response headers.
 - **Few dependencies.** Only `chi`, `santhosh-tekuri/jsonschema/v6` and `go.yaml.in/yaml/v3`. Everything else, including JWT verification, uses the standard library.
@@ -89,7 +89,12 @@ Each validation entry takes either an inline `schema` or a `file` path (relative
 - **`body`**: validates JSON request bodies. `required` defaults to true. `contentTypes` defaults to `application/json` and `application/*+json`. A non-UTF-8 `charset` is rejected with 415.
 - **`query`**: the query string is converted to an object. A parameter that appears once becomes a string, and a repeated parameter becomes an array of strings. Set `additionalProperties: false` to allowlist parameters.
 - **`params`**: route params as an object of strings.
-- **`response`**: buffers the upstream response (up to `maxBytes`, default 4 MiB) for the listed `statusCodes` (default: all 2xx) and validates it. If validation fails, the client gets a **502** and the response body is never forwarded. When this is enabled, the gateway negotiates encoding itself so it can decode compressed responses before validating.
+- **`response`**: buffers the upstream response (up to `maxBytes`, default 4 MiB) for the listed `statusCodes` (default: all 2xx), strips every property the schema does not declare, then validates what is left. When this is enabled, the gateway negotiates encoding itself so it can decode compressed responses first.
+  - A property is kept when it is listed in `properties`, matches `patternProperties`, is named in `required`, or is admitted by `additionalProperties` / `unevaluatedProperties` (`true` or a schema). Declarations reached through `$ref`, `allOf`, `anyOf`, `oneOf` and `if`/`then`/`else` all count. Anything else is removed, including when `additionalProperties` is simply omitted.
+  - An object whose schema says nothing about its properties (for example `{type: object}`) is forwarded whole, so declare `properties` on every object you want filtered.
+  - Array elements are filtered in place and never removed.
+  - A response that still violates the schema after filtering (missing required property, wrong type, non-JSON content type, over `maxBytes`) is replaced with a generic **502** and logged.
+  - A response with nothing to strip is forwarded byte for byte; otherwise it is re-encoded, which sorts object keys.
 
 A request that violates the contract gets an RFC 9457 `application/problem+json` 400 response:
 

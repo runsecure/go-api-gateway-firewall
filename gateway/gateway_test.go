@@ -506,7 +506,7 @@ routes:
     path: /r
     methods: [GET]
     auth: [anonymous]
-    upstream: {targets: [%s]}
+    upstream: {targets: [%[1]s]}
     validation:
       response:
         schema:
@@ -514,15 +514,73 @@ routes:
           required: [id]
           additionalProperties: false
           properties: {id: {type: integer}}
+  - name: nested
+    path: /nested
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%[1]s]}
+    validation:
+      response:
+        schema:
+          $defs:
+            item:
+              type: object
+              properties: {sku: {type: string}}
+          type: object
+          required: [id, kind]
+          properties:
+            id: {type: integer}
+            owner:
+              type: object
+              properties: {name: {type: string}}
+            items:
+              type: array
+              items: {$ref: "#/$defs/item"}
+            meta: {type: object}
+            labels:
+              type: object
+              additionalProperties: {type: string}
+          patternProperties:
+            "^x-": {type: string}
+          allOf:
+            - properties: {total: {type: number}}
 `, up.URL))
-	body = `{"id":1}`
-	if rec := do(t, gw, "GET", "/r", "", nil); rec.Code != 200 || rec.Body.String() != body {
-		t.Fatalf("valid response: %d %s", rec.Code, rec.Body)
+
+	cases := []struct {
+		name, path, upstream, want string
+		code                       int
+	}{
+		{"conforming body is forwarded byte for byte", "/r", `{ "id": 1 }`, `{ "id": 1 }`, 200},
+		{"undeclared property is stripped", "/r", `{"id":1,"passwordHash":"leak"}`, `{"id":1}`, 200},
+		{"missing required property is rejected", "/r", `{"passwordHash":"leak"}`, "", 502},
+		{"wrong type is rejected", "/r", `{"id":"1","passwordHash":"leak"}`, "", 502},
+		{"non-object is rejected", "/r", `["leak"]`, "", 502},
+		{"nested objects, arrays, refs, patterns and allOf",
+			"/nested",
+			`{"id":1,"kind":"k","secret":"leak","total":2.50,"x-trace":"t","y-trace":"leak",
+			  "owner":{"name":"a","ssn":"leak"},
+			  "items":[{"sku":"s","cost":"leak"},{"sku":"t"}],
+			  "meta":{"anything":{"goes":true}},
+			  "labels":{"a":"<b>"}}`,
+			`{"id":1,"items":[{"sku":"s"},{"sku":"t"}],"kind":"k","labels":{"a":"<b>"},` +
+				`"meta":{"anything":{"goes":true}},"owner":{"name":"a"},"total":2.50,"x-trace":"t"}`,
+			200},
 	}
-	body = `{"id":1,"passwordHash":"leak"}`
-	rec := do(t, gw, "GET", "/r", "", nil)
-	if rec.Code != 502 || strings.Contains(rec.Body.String(), "leak") || !strings.Contains(rec.Body.String(), `"detail":"bad gateway"`) {
-		t.Fatalf("invalid response passed: %d %s", rec.Code, rec.Body)
+	for _, tc := range cases {
+		body = tc.upstream
+		rec := do(t, gw, "GET", tc.path, "", nil)
+		if rec.Code != tc.code || strings.Contains(rec.Body.String(), "leak") {
+			t.Errorf("%s: %d %s", tc.name, rec.Code, rec.Body)
+			continue
+		}
+		switch {
+		case tc.code == 200 && rec.Body.String() != tc.want:
+			t.Errorf("%s: got %s, want %s", tc.name, rec.Body, tc.want)
+		case tc.code == 200 && rec.Header().Get("Content-Length") != fmt.Sprint(len(tc.want)):
+			t.Errorf("%s: content-length %q", tc.name, rec.Header().Get("Content-Length"))
+		case tc.code != 200 && !strings.Contains(rec.Body.String(), `"detail":"bad gateway"`):
+			t.Errorf("%s: unexpected error body %s", tc.name, rec.Body)
+		}
 	}
 }
 
