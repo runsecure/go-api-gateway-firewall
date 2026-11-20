@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -162,8 +163,47 @@ func (p *routeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		r = r.WithContext(ctx)
 	}
-	p.rp.ServeHTTP(w, r)
+	p.rp.ServeHTTP(&interimSuppressor{ResponseWriter: w, saved: w.Header().Clone()}, r)
 }
+
+// interimSuppressor stops upstream 1xx interim responses (100 Continue, 103
+// Early Hints) reaching the caller. ReverseProxy forwards their headers
+// straight to the client, bypassing ModifyResponse and the header allowlist.
+// After forwarding one, ReverseProxy clears the header map, so the gateway's
+// own headers are restored on the next access.
+type interimSuppressor struct {
+	http.ResponseWriter
+	saved   http.Header
+	restore bool
+}
+
+func (w *interimSuppressor) Header() http.Header {
+	h := w.ResponseWriter.Header()
+	if w.restore {
+		w.restore = false
+		clear(h)
+		for k, v := range w.saved {
+			h[k] = v
+		}
+	}
+	return h
+}
+
+func (w *interimSuppressor) WriteHeader(code int) {
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		w.restore = true
+		return
+	}
+	w.Header()
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *interimSuppressor) Write(b []byte) (int, error) {
+	w.Header()
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *interimSuppressor) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (p *routeProxy) pick() *url.URL {
 	if len(p.targets) == 1 {
@@ -280,6 +320,7 @@ func (e *upstreamStatusError) Error() string {
 }
 
 func (p *routeProxy) modifyResponse(resp *http.Response) error {
+	requestLogFrom(resp.Request.Context()).setUpstreamStatus(resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return &upstreamStatusError{status: resp.StatusCode}
 	}
@@ -294,8 +335,35 @@ func (p *routeProxy) modifyResponse(resp *http.Response) error {
 				"request_id", RequestIDFrom(ctx), "count", stripped)
 		}
 	}
+	dropped := p.respHeaders.filterUpstream(resp.Header, resp.StatusCode == http.StatusSwitchingProtocols)
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		// Trailers bypass ModifyResponse: they are filled in once the body
+		// is read, so filter them on Close, before ReverseProxy copies them.
+		// A 101 body is the raw connection and must not be wrapped.
+		dropped = append(dropped, p.respHeaders.filterUpstream(resp.Trailer, false)...)
+		resp.Body = &trailerFilter{ReadCloser: resp.Body, resp: resp, rules: p.respHeaders}
+	}
+	if len(dropped) > 0 {
+		ctx := resp.Request.Context()
+		p.logger.DebugContext(ctx, "upstream response headers dropped", "route", p.name,
+			"request_id", RequestIDFrom(ctx), "headers", dropped)
+	}
 	p.respHeaders.apply(resp.Header)
 	return nil
+}
+
+// trailerFilter drops non-allowlisted trailers once the upstream body has
+// been read and its trailers populated.
+type trailerFilter struct {
+	io.ReadCloser
+	resp  *http.Response
+	rules headerRules
+}
+
+func (t *trailerFilter) Close() error {
+	err := t.ReadCloser.Close()
+	t.rules.filterUpstream(t.resp.Trailer, false)
+	return err
 }
 
 // errorHandler logs the real failure and answers through the same status
@@ -311,18 +379,22 @@ func (p *routeProxy) errorHandler(w http.ResponseWriter, r *http.Request, err er
 		return
 	case errors.As(err, &statusErr):
 		status = statusErr.status
+		requestLogFrom(ctx).setUpstreamError(upstreamErrStatus)
 		p.logger.WarnContext(ctx, "upstream error status", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "upstream_status", status)
 	case errors.Is(err, context.DeadlineExceeded):
 		status = http.StatusGatewayTimeout
+		requestLogFrom(ctx).setUpstreamError(upstreamErrTimeout)
 		p.logger.WarnContext(ctx, "upstream timeout", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
 	case errors.Is(err, errResponseContract):
 		status = http.StatusBadGateway
+		requestLogFrom(ctx).setUpstreamError(upstreamErrContract)
 		p.logger.ErrorContext(ctx, "upstream response rejected", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
 	default:
 		status = http.StatusBadGateway
+		requestLogFrom(ctx).setUpstreamError(upstreamErrUnreachable)
 		p.logger.WarnContext(ctx, "upstream error", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
 	}

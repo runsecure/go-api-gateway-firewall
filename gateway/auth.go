@@ -101,6 +101,8 @@ func authMiddleware(auths []namedAuth, scopes []string, forward map[string]strin
 				WriteProblem(w, r, http.StatusUnauthorized, "authentication required")
 				return
 			}
+			// Recorded before the scope check so 403s show who was refused.
+			requestLogFrom(r.Context()).setPrincipal(p)
 			for _, s := range scopes {
 				if !p.HasScope(s) {
 					WriteProblem(w, r, http.StatusForbidden, "insufficient scope")

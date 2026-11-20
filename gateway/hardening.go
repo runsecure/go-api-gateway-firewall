@@ -96,10 +96,12 @@ func (l *requestLimits) middleware(next http.Handler) http.Handler {
 	})
 }
 
-// headerRules applies set/remove rules to a header map.
+// headerRules applies set/remove rules to a header map, and for responses
+// holds the allowlist of upstream headers.
 type headerRules struct {
 	set    [][2]string
 	remove []string
+	allow  map[string]bool
 }
 
 func compileHeaderRules(rules ...HeaderRules) headerRules {
@@ -111,8 +113,30 @@ func compileHeaderRules(rules ...HeaderRules) headerRules {
 		for k, v := range r.Set {
 			hr.set = append(hr.set, [2]string{http.CanonicalHeaderKey(k), v})
 		}
+		for _, h := range r.Allow {
+			if hr.allow == nil {
+				hr.allow = map[string]bool{}
+			}
+			hr.allow[http.CanonicalHeaderKey(h)] = true
+		}
 	}
 	return hr
+}
+
+// filterUpstream deletes every header in h that is not allowlisted and
+// returns the names removed. A 101 response also keeps the headers needed to
+// complete the protocol switch.
+func (hr headerRules) filterUpstream(h http.Header, switching bool) []string {
+	var dropped []string
+	for k := range h {
+		ck := http.CanonicalHeaderKey(k)
+		if hr.allow[ck] || (switching && switchingProtocolHeaders[ck]) {
+			continue
+		}
+		delete(h, k)
+		dropped = append(dropped, ck)
+	}
+	return dropped
 }
 
 func (hr headerRules) empty() bool { return len(hr.set) == 0 && len(hr.remove) == 0 }
@@ -141,14 +165,43 @@ func (p *routeProxy) concurrencyLimit(max int) func(http.Handler) http.Handler {
 				ctx := r.Context()
 				p.logger.WarnContext(ctx, "route at concurrency limit", "route", p.name,
 					"request_id", RequestIDFrom(ctx), "max_concurrent", max)
+				requestLogFrom(ctx).setUpstreamError(upstreamErrShed)
 				p.writeUpstreamError(w, r, http.StatusServiceUnavailable)
 			}
 		})
 	}
 }
 
+// defaultAllowedResponseHeaders are the upstream response headers forwarded
+// to the caller on every route. Everything else an upstream sends is dropped
+// unless a route or the defaults add it with responseHeaders.allow.
+var defaultAllowedResponseHeaders = []string{
+	"Content-Type",
+	"Content-Length",
+	"Content-Encoding",
+	"Content-Language",
+	"Cache-Control",
+	"Expires",
+	"ETag",
+	"Last-Modified",
+	"Vary",
+	"Accept-Ranges",
+	"Content-Range",
+}
+
+// switchingProtocolHeaders are kept on a 101 response so protocol upgrades
+// (WebSocket, h2c) can complete.
+var switchingProtocolHeaders = map[string]bool{
+	"Connection":               true,
+	"Upgrade":                  true,
+	"Sec-Websocket-Accept":     true,
+	"Sec-Websocket-Protocol":   true,
+	"Sec-Websocket-Extensions": true,
+}
+
 // defaultResponseHeaders hardens every response leaving the gateway.
 var defaultResponseHeaders = HeaderRules{
+	Allow: defaultAllowedResponseHeaders,
 	Set: map[string]string{
 		"X-Content-Type-Options": "nosniff",
 		"X-Frame-Options":        "DENY",

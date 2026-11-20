@@ -10,6 +10,7 @@ server:
   healthPath: /healthz
   trustedProxies: [10.0.0.0/8]   # load balancer ranges allowed to set X-Forwarded-For
   exposeValidationErrors: true
+  logHeaders: [X-True-Ip, Traceparent, X-Correlation-Id]   # extra inbound headers in the access log
 
 defaults:
   auth: [users]          # every route requires a user JWT unless overridden

@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,7 +54,22 @@ type ServerConfig struct {
 
 	// AccessLog enables structured per-request logging. Defaults to true.
 	AccessLog *bool `json:"accessLog,omitempty"`
+
+	// LogHeaders lists inbound request headers whose values are added to the
+	// access log under "headers", e.g. a CDN client-IP header or trace IDs.
+	// Values are logged as received, before any gateway processing.
+	// Credential headers cannot be listed.
+	LogHeaders []string `json:"logHeaders,omitempty"`
 }
+
+// Limits on server.logHeaders.
+const (
+	maxLogHeaders         = 32
+	maxLoggedHeaderLength = 256
+)
+
+// credentialHeaders can never be logged.
+var credentialHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key"}
 
 // TLSConfig enables HTTPS on the listener.
 type TLSConfig struct {
@@ -157,6 +174,10 @@ type ResponseValidation struct {
 type HeaderRules struct {
 	Set    map[string]string `json:"set,omitempty"`
 	Remove []string          `json:"remove,omitempty"`
+	// Allow (response headers only) extends the allowlist of upstream
+	// response headers forwarded to the caller. Upstream headers not on the
+	// built-in list or any applicable Allow list are dropped.
+	Allow []string `json:"allow,omitempty"`
 }
 
 // HardeningConfig contains request hardening limits. Zero values inherit
@@ -271,6 +292,18 @@ func (c *Config) Validate() error {
 			add("server.trustedProxies: %v", err)
 		}
 	}
+	if len(c.Server.LogHeaders) > maxLogHeaders {
+		add("server.logHeaders: at most %d headers", maxLogHeaders)
+	}
+	secret := c.credentialHeaders()
+	for _, h := range c.Server.LogHeaders {
+		switch {
+		case !validHeaderName(h):
+			add("server.logHeaders: invalid header name %q", h)
+		case slices.Contains(secret, http.CanonicalHeaderKey(h)):
+			add("server.logHeaders: %q carries credentials and cannot be logged", h)
+		}
+	}
 	if t := c.Server.TLS; t != nil && (t.CertFile == "" || t.KeyFile == "") {
 		add("server.tls: certFile and keyFile are both required")
 	}
@@ -315,6 +348,14 @@ func (c *Config) Validate() error {
 				add("routes.%s: invalid upstream target %q", id, t)
 			}
 		}
+		if len(r.RequestHeaders.Allow) > 0 {
+			add("routes.%s: requestHeaders.allow is not supported", id)
+		}
+		for _, h := range r.ResponseHeaders.Allow {
+			if !validHeaderName(h) {
+				add("routes.%s: invalid responseHeaders.allow entry %q", id, h)
+			}
+		}
 		if r.Upstream.MaxConcurrent < 0 {
 			add("routes.%s: upstream.maxConcurrent must be >= 0", id)
 		}
@@ -348,12 +389,36 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	for _, h := range c.Defaults.ResponseHeaders.Allow {
+		if !validHeaderName(h) {
+			add("defaults: invalid responseHeaders.allow entry %q", h)
+		}
+	}
 	if rl := c.Defaults.Hardening.RateLimit; rl != nil {
 		if err := rl.validate(); err != nil {
 			add("defaults: %v", err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// credentialHeaders returns the canonical names of headers that carry
+// credentials: the fixed list plus any "header" option set on an
+// authenticator (the built-in jwt and apikey types both use it).
+func (c *Config) credentialHeaders() []string {
+	out := slices.Clone(credentialHeaders)
+	for i := range out {
+		out[i] = http.CanonicalHeaderKey(out[i])
+	}
+	for _, a := range c.Authenticators {
+		var o struct {
+			Header string `json:"header"`
+		}
+		if json.Unmarshal(a.Options, &o) == nil && o.Header != "" {
+			out = append(out, http.CanonicalHeaderKey(o.Header))
+		}
+	}
+	return out
 }
 
 func (r *RateLimitConfig) validate() error {

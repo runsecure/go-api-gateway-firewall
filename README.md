@@ -21,6 +21,32 @@ bin/gateway -config examples/gateway.yaml
 
 Flags (each also settable as an environment variable): `-config` (`GATEWAY_CONFIG`), `-log-level` (`GATEWAY_LOG_LEVEL`), `-log-format json|text` (`GATEWAY_LOG_FORMAT`), `-check`.
 
+Each request writes one access-log record (`msg: "request"`) unless `server.accessLog` is `false`:
+
+| Field | Notes |
+|---|---|
+| `request_id`, `client_ip`, `method`, `path` | Always present. The query string is never logged. |
+| `route` | The matched route name. Absent for requests that match no route. |
+| `principal`, `authenticator` | The authenticated subject and the authenticator that accepted it. Also present on 403s for missing scopes. |
+| `status` | The status sent to the caller, or `499` when the client disconnected before a response was written. |
+| `upstream_status` | The status the upstream actually returned, before mapping. Absent when no upstream response was received. |
+| `upstream_error` | Why an upstream failure was replaced with a generic error: `status`, `timeout`, `unreachable`, `contract` or `concurrency_limit`. |
+| `headers` | Values of the inbound headers listed in `server.logHeaders`, keyed by lower-case name. Absent when none of them were sent. |
+| `bytes`, `duration` | Response body bytes and total time (nanoseconds in JSON). |
+
+Warnings and errors with more detail are logged separately and share the same `request_id`.
+
+`server.logHeaders` adds inbound headers to the access log, such as a CDN's client-IP header or trace and correlation IDs:
+
+```yaml
+server:
+  logHeaders: [X-True-Ip, CloudFront-Viewer-Address, Traceparent, X-Amzn-Trace-Id, X-Correlation-Id]
+```
+
+- Values are captured as the request arrives, before the gateway changes any header. Repeated headers are joined with `, ` and each value is cut to 256 bytes. At most 32 headers can be listed.
+- These are client-supplied values. A request that bypasses your CDN can set any of them, so treat them as information, not proof. Use `server.trustedProxies` for the `client_ip` the gateway relies on.
+- Credential headers are refused at startup: `Authorization`, `Proxy-Authorization`, `Cookie`, `X-Api-Key`, and any `header` option set on an authenticator. A custom authenticator type that reads credentials from another option name is not detected, so do not list that header.
+
 Docker:
 
 ```sh
@@ -77,7 +103,7 @@ routes:
 | `middleware` | Names registered with `WithNamedMiddleware`. |
 | `validation` | `body`, `query`, `params`, `response`. See below. |
 | `hardening` | Per-route overrides of `defaults.hardening`. |
-| `requestHeaders` / `responseHeaders` | `{set: {...}, remove: [...]}`. |
+| `requestHeaders` / `responseHeaders` | `{set: {...}, remove: [...]}`. `responseHeaders` also takes `allow: [...]`, which adds upstream headers to the forwarding allowlist (see Hardening). |
 | `requestHeaderMap` | Maps an upstream header name to an incoming header name, for example `{X-Correlation-Id: X-Request-Id}`. |
 
 Ordinary incoming headers are forwarded by default. `requestHeaderMap` copies all values from the source after authentication and hop-by-hop stripping; if the source is absent, the destination is removed. Mappings use a snapshot, so they do not chain, and `requestHeaders` rules apply afterward. Mapping destinations cannot be hop-by-hop, forwarding, framing, or `forwardIdentity` headers. Client-provided values remain untrusted; do not map them to headers that upstream services treat as authenticated identity.
@@ -123,7 +149,9 @@ These checks always run, whatever the config:
 - Request bodies are checked for valid UTF-8, nesting depth and trailing data. These are common causes of parser differences between the gateway and an upstream.
 - Inbound `X-Forwarded-*` and `Forwarded` headers are discarded unless the direct peer is in `server.trustedProxies`.
 - Hop-by-hop headers are stripped. The API key header is not forwarded upstream.
-- `Server` and `X-Powered-By` are removed from responses. `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer` are added.
+- Upstream response headers are **allowlisted**. Only `Content-Type`, `Content-Length`, `Content-Encoding`, `Content-Language`, `Cache-Control`, `Expires`, `ETag`, `Last-Modified`, `Vary`, `Accept-Ranges` and `Content-Range` are forwarded, plus anything listed in `responseHeaders.allow` on the defaults or the route. Everything else (for example `Set-Cookie`, `Location`, `Link`, `Via`, `Server`, `Server-Timing`) is dropped and its name logged at debug level. A route that relies on cookies or redirects must allow those headers explicitly.
+- Upstream trailers go through the same allowlist. Upstream `1xx` interim responses (such as `103 Early Hints`) are never forwarded. A `101 Switching Protocols` response keeps `Connection`, `Upgrade` and the `Sec-WebSocket-*` headers so upgrades still work.
+- `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer` are added to every response, overriding upstream values.
 - Every request gets an `X-Request-Id`. A client-supplied ID is kept only if it is 64 characters or fewer and uses only safe characters.
 - Server read, header and idle timeouts and `maxHeaderBytes` all have safe defaults.
 

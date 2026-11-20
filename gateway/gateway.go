@@ -116,7 +116,7 @@ func New(cfg *Config, opts ...Option) (*Gateway, error) {
 	}
 
 	g := &Gateway{cfg: cfg, mux: chi.NewMux(), logger: o.logger, registered: map[string]string{}}
-	g.mux.Use(entryMiddleware(o.logger, ips, boolOr(cfg.Server.AccessLog, true)), pathGuard)
+	g.mux.Use(entryMiddleware(o.logger, ips, boolOr(cfg.Server.AccessLog, true), cfg.Server.LogHeaders), pathGuard)
 	g.mux.Use(o.global...)
 
 	globalResp := compileHeaderRules(defaultResponseHeaders, cfg.Defaults.ResponseHeaders)
@@ -267,7 +267,7 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 	p.init(o.transport, buffers)
 
 	// Middleware chain, outermost first.
-	var chain []Middleware
+	chain := []Middleware{routeTag(rc.Name)}
 	limits := &requestLimits{
 		maxURL: h.MaxURLLength, maxQuery: h.MaxQueryParams, maxBody: h.MaxBodyBytes,
 		allowEncSlash: boolOr(h.AllowEncodedSlashes, false),

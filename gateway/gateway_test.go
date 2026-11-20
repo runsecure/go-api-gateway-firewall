@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,8 +12,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
+	"net/textproto"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -494,6 +499,7 @@ routes:
 }
 
 func TestConcurrencyLimitIsIndistinguishable(t *testing.T) {
+	logs := &logCapture{}
 	entered, release := make(chan struct{}), make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/fail" {
@@ -511,7 +517,7 @@ routes:
     methods: [GET]
     auth: [anonymous]
     upstream: {targets: [%s], maxConcurrent: 1}
-`, up.URL))
+`, up.URL), WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 
 	done := make(chan struct{})
 	go func() {
@@ -526,6 +532,9 @@ routes:
 
 	if shed.Code != 502 || shed.Header().Get("Retry-After") != "" {
 		t.Fatalf("shed request: %d retry-after=%q %s", shed.Code, shed.Header().Get("Retry-After"), shed.Body)
+	}
+	if line := logs.accessLine(t, shed.Header().Get(RequestIDHeader)); line["upstream_error"] != "concurrency_limit" {
+		t.Errorf("shed access log: %v", line)
 	}
 	strip := func(rec *httptest.ResponseRecorder) (Problem, http.Header) {
 		var p Problem
@@ -719,17 +728,311 @@ routes:
 	}
 }
 
+func TestResponseHeaderAllowlist(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		if r.URL.Path == "/hints" {
+			h.Set("Link", "<http://db-7.internal/x>; rel=preload")
+			h.Set("X-Internal-Host", "db-7.internal")
+			w.WriteHeader(http.StatusEarlyHints)
+		}
+		h.Set("Content-Type", "application/json")
+		h.Set("ETag", `"v1"`)
+		h.Set("Cache-Control", "max-age=5")
+		h.Set("Set-Cookie", "session=secret")
+		h.Set("Via", "1.1 internal-lb")
+		h.Set("X-Backend-Server", "db-7.internal")
+		h.Set("Server-Timing", "db;dur=53")
+		h.Set("Location", "http://db-7.internal/orders/1")
+		h.Set("X-Frame-Options", "ALLOWALL")
+		h.Set("X-Route-Allowed", "yes")
+		h.Set("X-Default-Allowed", "yes")
+		h.Set("Trailer", "X-Checksum, X-Trace-Host")
+		_, _ = io.WriteString(w, `{}`)
+		h.Set("X-Checksum", "abc")
+		h.Set("X-Trace-Host", "db-7.internal")
+		h.Set(http.TrailerPrefix+"X-Unannounced", "db-7.internal")
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+defaults:
+  responseHeaders:
+    allow: [X-Default-Allowed]
+routes:
+  - name: r
+    path: /{p}
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s]}
+    responseHeaders:
+      allow: [x-route-allowed, X-Checksum]
+      set: {X-Route-Set: "1"}
+`, up.URL))
+	front := httptest.NewServer(gw)
+	defer front.Close()
+
+	for _, path := range []string{"/plain", "/hints"} {
+		var interim []int
+		ctx := httptrace.WithClientTrace(t.Context(), &httptrace.ClientTrace{
+			Got1xxResponse: func(code int, _ textproto.MIMEHeader) error {
+				interim = append(interim, code)
+				return nil
+			},
+		})
+		req, _ := http.NewRequestWithContext(ctx, "GET", front.URL+path, nil)
+		resp, err := front.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != 200 || string(body) != "{}" {
+			t.Fatalf("%s: %d %s", path, resp.StatusCode, body)
+		}
+		if len(interim) > 0 {
+			t.Errorf("%s: interim responses forwarded: %v", path, interim)
+		}
+		want := map[string]string{
+			"Content-Type":      "application/json",
+			"Etag":              `"v1"`,
+			"Cache-Control":     "max-age=5",
+			"X-Route-Allowed":   "yes",
+			"X-Default-Allowed": "yes",
+			"X-Route-Set":       "1",
+			"X-Frame-Options":   "DENY",
+			"X-Request-Id":      resp.Header.Get("X-Request-Id"),
+		}
+		if want["X-Request-Id"] == "" {
+			t.Errorf("%s: gateway request ID lost", path)
+		}
+		for k, v := range want {
+			if got := resp.Header.Get(k); got != v {
+				t.Errorf("%s: header %s = %q, want %q", path, k, got, v)
+			}
+		}
+		for _, k := range []string{"Set-Cookie", "Via", "X-Backend-Server", "Server-Timing", "Location", "Link", "X-Internal-Host"} {
+			if v := resp.Header.Get(k); v != "" {
+				t.Errorf("%s: header %s leaked: %q", path, k, v)
+			}
+		}
+		if got := resp.Trailer.Get("X-Checksum"); got != "abc" {
+			t.Errorf("%s: allowed trailer X-Checksum = %q", path, got)
+		}
+		for k, v := range resp.Trailer {
+			if strings.Contains(strings.Join(v, ""), "internal") {
+				t.Errorf("%s: trailer %s leaked: %q", path, k, v)
+			}
+		}
+	}
+}
+
+// logCapture collects JSON log records written by the gateway.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(b)
+}
+
+// accessLine returns the access-log record for requestID.
+func (c *logCapture) accessLine(t *testing.T, requestID string) map[string]any {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, line := range bytes.Split(c.buf.Bytes(), []byte("\n")) {
+		var m map[string]any
+		if json.Unmarshal(line, &m) == nil && m["msg"] == "request" && m["request_id"] == requestID {
+			return m
+		}
+	}
+	t.Fatalf("no access log for request %s in:\n%s", requestID, c.buf.String())
+	return nil
+}
+
+func TestAccessLogFields(t *testing.T) {
+	t.Setenv("TEST_PARTNER_KEY", "partner-key-0123456789")
+	entered := make(chan struct{}, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fail":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/slow", "/hang":
+			entered <- struct{}{}
+			select {
+			case <-time.After(time.Second):
+			case <-r.Context().Done():
+			}
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":1}`)
+		}
+	}))
+	defer up.Close()
+	logs := &logCapture{}
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  partners:
+    type: apikey
+    options:
+      keys: {acme: "env:TEST_PARTNER_KEY"}
+      scopes: {acme: [orders:read]}
+routes:
+  - name: orders
+    path: /{p}
+    methods: [GET]
+    auth: [partners]
+    upstream: {targets: [%[1]s], timeout: 50ms}
+  - name: admin
+    path: /admin/x
+    methods: [GET]
+    auth: [partners]
+    requiredScopes: [admin]
+    upstream: {targets: [%[1]s]}
+  - name: contract
+    path: /contract/x
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%[1]s]}
+    validation:
+      response:
+        schema: {type: object, required: [name]}
+  - name: down
+    path: /down/x
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: ["http://127.0.0.1:1"]}
+`, up.URL), WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	key := map[string]string{"X-API-Key": "partner-key-0123456789"}
+
+	type want struct {
+		status         int
+		route          string
+		principal      string
+		upstreamStatus int
+		upstreamError  string
+	}
+	cases := map[string]struct {
+		path string
+		hdr  map[string]string
+		want want
+	}{
+		"success":        {"/ok", key, want{200, "orders", "acme", 200, ""}},
+		"upstream 500":   {"/fail", key, want{502, "orders", "acme", 500, "status"}},
+		"timeout":        {"/slow", key, want{502, "orders", "acme", 0, "timeout"}},
+		"contract":       {"/contract/x", nil, want{502, "contract", "", 200, "contract"}},
+		"unreachable":    {"/down/x", nil, want{502, "down", "", 0, "unreachable"}},
+		"missing scope":  {"/admin/x", key, want{403, "admin", "acme", 0, ""}},
+		"no credentials": {"/ok", nil, want{401, "orders", "", 0, ""}},
+		"no route":       {"/a/b/c", nil, want{404, "", "", 0, ""}},
+	}
+	check := func(name string, line map[string]any, w want) {
+		t.Helper()
+		num := func(k string) int { f, _ := line[k].(float64); return int(f) }
+		str := func(k string) string { s, _ := line[k].(string); return s }
+		if num("status") != w.status || str("route") != w.route || str("principal") != w.principal ||
+			num("upstream_status") != w.upstreamStatus || str("upstream_error") != w.upstreamError {
+			t.Errorf("%s: access log %v, want %+v", name, line, w)
+		}
+		if w.principal != "" && str("authenticator") != "partners" {
+			t.Errorf("%s: authenticator %q", name, str("authenticator"))
+		}
+	}
+	for name, tc := range cases {
+		rec := do(t, gw, "GET", tc.path, "", tc.hdr)
+		select {
+		case <-entered:
+		default:
+		}
+		if rec.Code != tc.want.status {
+			t.Errorf("%s: response %d, want %d", name, rec.Code, tc.want.status)
+		}
+		check(name, logs.accessLine(t, rec.Header().Get(RequestIDHeader)), tc.want)
+	}
+
+	// Client disconnects while the upstream is still working.
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(ctx, "GET", "/hang", nil)
+	req.Header.Set("X-API-Key", key["X-API-Key"])
+	req.Header.Set(RequestIDHeader, "client-gone")
+	rec := httptest.NewRecorder()
+	go func() { <-entered; cancel() }()
+	gw.ServeHTTP(rec, req)
+	check("client disconnect", logs.accessLine(t, "client-gone"),
+		want{StatusClientClosedRequest, "orders", "acme", 0, ""})
+}
+
+func TestAccessLogHeaders(t *testing.T) {
+	up := newEcho(t)
+	logs := &logCapture{}
+	gw := mustGateway(t, fmt.Sprintf(`
+server:
+  logHeaders: [x-true-ip, Traceparent, X-Correlation-Id, X-Request-Id, X-Absent]
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s]}
+`, up.URL), WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+
+	req := httptest.NewRequest("GET", "/r", nil)
+	req.Header.Set("X-True-Ip", "198.51.100.9")
+	req.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	req.Header.Add("X-Correlation-Id", "a")
+	req.Header.Add("X-Correlation-Id", "b")
+	req.Header.Set("X-Request-Id", strings.Repeat("z", 300)) // invalid, so the gateway replaces it
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+
+	line := logs.accessLine(t, rec.Header().Get(RequestIDHeader))
+	got, _ := line["headers"].(map[string]any)
+	want := map[string]any{
+		"x-true-ip":        "198.51.100.9",
+		"traceparent":      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"x-correlation-id": "a, b",
+		// Logged as received and truncated, not the ID the gateway assigned.
+		"x-request-id": strings.Repeat("z", maxLoggedHeaderLength),
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("headers = %v, want %v", got, want)
+	}
+	if strings.Contains(fmt.Sprint(line), "secret") {
+		t.Fatalf("unconfigured header logged: %v", line)
+	}
+
+	// No configured header present: no "headers" group at all.
+	rec = do(t, gw, "GET", "/r", "", nil)
+	if line := logs.accessLine(t, rec.Header().Get(RequestIDHeader)); line["headers"] != nil {
+		t.Fatalf("empty headers group logged: %v", line)
+	}
+}
+
 func TestConfigErrors(t *testing.T) {
 	bad := map[string]string{
-		"unknown field":   "routes: []\nbogus: 1",
-		"no routes":       "routes: []",
-		"bad target":      "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [ftp://x]}}]",
-		"unknown auth":    "routes: [{name: a, path: /a, methods: [GET], auth: [nope], upstream: {targets: [http://x]}}]",
-		"bad schema":      "routes: [{name: a, path: /a, methods: [POST], auth: [anonymous], upstream: {targets: [http://x]}, validation: {body: {schema: {type: 5}}}}]",
-		"unknown param":   "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x], path: /b/{id}}}]",
-		"duplicate route": "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}, {name: b, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
-		"bad pattern":     "routes: [{name: a, path: '/a/*/b', methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
-		"bad duration":    "defaults: {timeout: 5}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"unknown field":      "routes: []\nbogus: 1",
+		"no routes":          "routes: []",
+		"bad target":         "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [ftp://x]}}]",
+		"unknown auth":       "routes: [{name: a, path: /a, methods: [GET], auth: [nope], upstream: {targets: [http://x]}}]",
+		"bad schema":         "routes: [{name: a, path: /a, methods: [POST], auth: [anonymous], upstream: {targets: [http://x]}, validation: {body: {schema: {type: 5}}}}]",
+		"unknown param":      "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x], path: /b/{id}}}]",
+		"duplicate route":    "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}, {name: b, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"bad pattern":        "routes: [{name: a, path: '/a/*/b', methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"bad duration":       "defaults: {timeout: 5}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log authorization":  "server: {logHeaders: [authorization]}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log cookie":         "server: {logHeaders: [Cookie]}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log default apikey": "server: {logHeaders: [x-api-key]}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log custom apikey":  "server: {logHeaders: [X-Partner-Key]}\nauthenticators: {p: {type: apikey, options: {header: x-partner-key, keys: {a: k}}}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log custom jwt":     "server: {logHeaders: [X-Token]}\nauthenticators: {j: {type: jwt, options: {header: X-Token}}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"log bad name":       "server: {logHeaders: ['a b']}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"request allow":      "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}, requestHeaders: {allow: [X-A]}}]",
+		"bad allow name":     "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}, responseHeaders: {allow: ['bad header']}}]",
+		"bad default allow":  "defaults: {responseHeaders: {allow: ['a:b']}}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
 	}
 	for name, y := range bad {
 		t.Run(name, func(t *testing.T) {
