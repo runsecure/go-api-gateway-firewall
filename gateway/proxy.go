@@ -137,6 +137,7 @@ type routeProxy struct {
 	preserveHost bool
 	timeout      time.Duration
 	reqHeaders   headerRules
+	reqHeaderMap map[string]string
 	respHeaders  headerRules
 	respValid    *responseValidator
 	ips          *clientIPResolver
@@ -172,6 +173,7 @@ func (p *routeProxy) pick() *url.URL {
 }
 
 func (p *routeProxy) rewrite(pr *httputil.ProxyRequest) {
+	sourceHeaders := pr.Out.Header.Clone()
 	if p.tmpl != nil {
 		esc := p.tmpl.render(pr.In)
 		dec, err := url.PathUnescape(esc)
@@ -197,6 +199,13 @@ func (p *routeProxy) rewrite(pr *httputil.ProxyRequest) {
 		// Let the transport negotiate and transparently decode gzip so the
 		// body can be validated.
 		pr.Out.Header.Del("Accept-Encoding")
+	}
+	for dest, source := range p.reqHeaderMap {
+		values := sourceHeaders.Values(source)
+		pr.Out.Header.Del(dest)
+		for _, value := range values {
+			pr.Out.Header.Add(dest, value)
+		}
 	}
 	p.reqHeaders.apply(pr.Out.Header)
 }

@@ -87,6 +87,60 @@ func decodeEcho(t *testing.T, rec *httptest.ResponseRecorder) echoed {
 	return e
 }
 
+func TestRequestHeaderMap(t *testing.T) {
+	var received http.Header
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+defaults: {auth: [anonymous]}
+routes:
+  - name: test
+    path: /test
+    methods: [GET]
+    upstream: {targets: [%s]}
+    requestHeaderMap: {X-Internal: X-External, X-Missing: X-Absent, X-Rule: X-External, X-Connection-Copy: X-Hop}
+    requestHeaders: {set: {X-Rule: configured}}
+`, up.URL))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Add("x-external", "one")
+	req.Header.Add("X-External", "two")
+	req.Header.Set("X-Missing", "spoofed")
+	req.Header.Set("Connection", "X-Hop")
+	req.Header.Set("X-Hop", "secret")
+	rec := httptest.NewRecorder()
+	gw.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status: %d", rec.Code)
+	}
+	if got := received.Values("X-Internal"); len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("mapped values: %v", got)
+	}
+	if received.Get("X-Missing") != "" || received.Get("X-Connection-Copy") != "" {
+		t.Fatalf("unexpected mapped headers: %v", received)
+	}
+	if received.Get("X-Rule") != "configured" {
+		t.Fatalf("request header rule did not override mapping: %v", received)
+	}
+}
+
+func TestRequestHeaderMapValidation(t *testing.T) {
+	for _, mapping := range []map[string]string{
+		{"Bad Header": "X-Source"}, {"X-Target": "bad source"},
+		{"Connection": "X-Source"}, {"X-Forwarded-For": "X-Source"},
+		{"X-Target": "A", "x-target": "B"}, {"X-User": "X-Source"},
+	} {
+		cfg := &Config{Routes: []RouteConfig{{Name: "test", Path: "/", Methods: []string{"GET"},
+			Upstream:       UpstreamConfig{Targets: []string{"http://localhost"}},
+			ForwardHeaders: map[string]string{"x-user": "subject"}, RequestHeaderMap: mapping}}}
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("mapping %v accepted", mapping)
+		}
+	}
+}
+
 const orderSchema = `
           type: object
           additionalProperties: false

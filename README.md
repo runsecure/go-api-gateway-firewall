@@ -78,6 +78,9 @@ routes:
 | `validation` | `body`, `query`, `params`, `response`. See below. |
 | `hardening` | Per-route overrides of `defaults.hardening`. |
 | `requestHeaders` / `responseHeaders` | `{set: {...}, remove: [...]}`. |
+| `requestHeaderMap` | Maps an upstream header name to an incoming header name, for example `{X-Correlation-Id: X-Request-Id}`. |
+
+Ordinary incoming headers are forwarded by default. `requestHeaderMap` copies all values from the source after authentication and hop-by-hop stripping; if the source is absent, the destination is removed. Mappings use a snapshot, so they do not chain, and `requestHeaders` rules apply afterward. Mapping destinations cannot be hop-by-hop, forwarding, framing, or `forwardIdentity` headers. Client-provided values remain untrusted; do not map them to headers that upstream services treat as authenticated identity.
 
 ### Validation (API contract)
 

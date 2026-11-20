@@ -202,6 +202,7 @@ func (g *Gateway) addRoute(rc *RouteConfig, o *options, auths map[string]Authent
 		preserveHost: rc.Upstream.PreserveHost,
 		timeout:      rc.Upstream.Timeout.D(),
 		reqHeaders:   compileHeaderRules(rc.RequestHeaders),
+		reqHeaderMap: rc.RequestHeaderMap,
 		respHeaders:  compileHeaderRules(defaultResponseHeaders, cfg.Defaults.ResponseHeaders, rc.ResponseHeaders),
 		ips:          ips,
 		logger:       g.logger,

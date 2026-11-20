@@ -96,6 +96,8 @@ type RouteConfig struct {
 
 	RequestHeaders  HeaderRules `json:"requestHeaders"`
 	ResponseHeaders HeaderRules `json:"responseHeaders"`
+	// RequestHeaderMap maps upstream header names to incoming header names.
+	RequestHeaderMap map[string]string `json:"requestHeaderMap,omitempty"`
 
 	// Middleware lists names registered with WithNamedMiddleware, applied in
 	// order after authentication and before validation.
@@ -315,6 +317,25 @@ func (c *Config) Validate() error {
 		if r.Upstream.MaxConcurrent < 0 {
 			add("routes.%s: upstream.maxConcurrent must be >= 0", id)
 		}
+		mapped := map[string]bool{}
+		for dest, source := range r.RequestHeaderMap {
+			d := strings.ToLower(dest)
+			if !validHeaderName(dest) || !validHeaderName(source) {
+				add("routes.%s: invalid requestHeaderMap entry %q: %q", id, dest, source)
+			}
+			if mapped[d] {
+				add("routes.%s: duplicate requestHeaderMap destination %q", id, dest)
+			}
+			mapped[d] = true
+			if forbiddenMappedHeader(d) {
+				add("routes.%s: requestHeaderMap destination %q is reserved", id, dest)
+			}
+			for h := range r.ForwardHeaders {
+				if strings.EqualFold(dest, h) {
+					add("routes.%s: requestHeaderMap destination %q conflicts with forwardIdentity", id, dest)
+				}
+			}
+		}
 		for _, s := range []*SchemaRef{r.Validation.Query, r.Validation.Params, bodyRef(r.Validation.Body), respRef(r.Validation.Response)} {
 			if s != nil && (len(s.Schema) == 0) == (s.File == "") {
 				add("routes.%s: each validation entry needs exactly one of schema or file", id)
@@ -368,6 +389,27 @@ func (r *RouteConfig) authNames(defaults []string) []string {
 var validMethods = map[string]bool{
 	"GET": true, "HEAD": true, "POST": true, "PUT": true, "PATCH": true,
 	"DELETE": true, "OPTIONS": true,
+}
+
+func validHeaderName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+			return false
+		}
+	}
+	return true
+}
+
+func forbiddenMappedHeader(s string) bool {
+	switch s {
+	case "host", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade", "forwarded":
+		return true
+	}
+	return strings.HasPrefix(s, "x-forwarded-")
 }
 
 // effectiveHardening merges route overrides over defaults over built-ins.
