@@ -1,0 +1,541 @@
+package gateway
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"strings"
+	"testing"
+	"time"
+)
+
+// echo is an upstream that reports what it received.
+type echoed struct {
+	Method  string            `json:"method"`
+	Path    string            `json:"path"`
+	RawPath string            `json:"rawPath"`
+	Query   string            `json:"query"`
+	Body    string            `json:"body"`
+	Headers map[string]string `json:"headers"`
+	Host    string            `json:"host"`
+}
+
+func newEcho(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		e := echoed{Method: r.Method, Path: r.URL.Path, RawPath: r.URL.RawPath, Query: r.URL.RawQuery,
+			Body: string(b), Headers: map[string]string{}, Host: r.Host}
+		for k := range r.Header {
+			e.Headers[k] = r.Header.Get(k)
+		}
+		w.Header().Set("Server", "upstream/1.0")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(e)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func quietLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+func mustGateway(t *testing.T, yamlCfg string, opts ...Option) *Gateway {
+	t.Helper()
+	cfg, err := ParseConfig([]byte(yamlCfg), true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg.BaseDir = t.TempDir()
+	gw, err := New(cfg, append([]Option{WithLogger(quietLogger())}, opts...)...)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	return gw
+}
+
+func do(t *testing.T, h http.Handler, method, target, body string, hdr map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var rb io.Reader
+	if body != "" {
+		rb = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, rb)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeEcho(t *testing.T, rec *httptest.ResponseRecorder) echoed {
+	t.Helper()
+	var e echoed
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("decode echo (status %d): %v: %s", rec.Code, err, rec.Body.String())
+	}
+	return e
+}
+
+const orderSchema = `
+          type: object
+          additionalProperties: false
+          required: [sku, qty]
+          properties:
+            sku: {type: string, pattern: "^[A-Z0-9-]{3,32}$"}
+            qty: {type: integer, minimum: 1, maximum: 100}
+            email: {type: string, format: email}`
+
+func baseConfig(upstream string) string {
+	return fmt.Sprintf(`
+server:
+  healthPath: /healthz
+defaults:
+  auth: [anonymous]
+  hardening:
+    maxBodyBytes: 1024
+    maxJsonDepth: 8
+routes:
+  - name: create-order
+    path: /api/orders
+    methods: [POST]
+    upstream:
+      targets: [%[1]s]
+      path: /v1/orders
+    validation:
+      body:
+        schema:%[2]s
+  - name: get-order
+    path: /api/orders/{id}
+    methods: [GET]
+    upstream:
+      targets: [%[1]s]
+      path: /v1/orders/{id}
+    validation:
+      params:
+        schema:
+          type: object
+          properties:
+            id: {type: string, pattern: "^[0-9]+$"}
+      query:
+        schema:
+          type: object
+          additionalProperties: false
+          properties:
+            expand: {type: string, enum: [items, customer]}
+  - name: files
+    path: /files/*
+    methods: [GET]
+    upstream:
+      targets: [%[1]s]
+      path: /storage/{*}
+`, upstream, orderSchema)
+}
+
+func TestProxyAndBodyValidation(t *testing.T) {
+	up := newEcho(t)
+	gw := mustGateway(t, baseConfig(up.URL))
+
+	rec := do(t, gw, "POST", "/api/orders?x=1", `{"sku":"ABC-1","qty":2}`, nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	e := decodeEcho(t, rec)
+	if e.Path != "/v1/orders" || e.Query != "x=1" || e.Body != `{"sku":"ABC-1","qty":2}` {
+		t.Fatalf("unexpected upstream request: %+v", e)
+	}
+	if e.Headers["X-Request-Id"] == "" || e.Headers["X-Forwarded-For"] == "" {
+		t.Fatalf("missing forwarded headers: %+v", e.Headers)
+	}
+	if rec.Header().Get("Server") != "" || rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("response headers not hardened: %v", rec.Header())
+	}
+
+	cases := []struct {
+		name, body string
+		ct         string
+		want       int
+	}{
+		{"schema violation", `{"sku":"abc","qty":0}`, "application/json", 400},
+		{"extra property", `{"sku":"ABC-1","qty":2,"admin":true}`, "application/json", 400},
+		{"bad format", `{"sku":"ABC-1","qty":2,"email":"nope"}`, "application/json", 400},
+		{"malformed", `{"sku":`, "application/json", 400},
+		{"trailing data", `{"sku":"ABC-1","qty":2}{}`, "application/json", 400},
+		{"duplicate key", `{"sku":"ABC-1","qty":2,"qty":500}`, "application/json", 400},
+		{"too deep", `{"sku":"ABC-1","qty":2,"a":[[[[[[[[[1]]]]]]]]]}`, "application/json", 400},
+		{"invalid utf8", "{\"sku\":\"AB\xffC\",\"qty\":2}", "application/json", 400},
+		{"wrong content type", `{"sku":"ABC-1","qty":2}`, "text/plain", 415},
+		{"wrong charset", `{"sku":"ABC-1","qty":2}`, "application/json; charset=latin1", 415},
+		{"too large", `{"sku":"` + strings.Repeat("A", 2000) + `","qty":2}`, "application/json", 413},
+		{"vendor json", `{"sku":"ABC-1","qty":2}`, "application/vnd.api+json", 200},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := do(t, gw, "POST", "/api/orders", c.body, map[string]string{"Content-Type": c.ct})
+			if rec.Code != c.want {
+				t.Fatalf("got %d want %d: %s", rec.Code, c.want, rec.Body)
+			}
+			if c.want >= 400 && rec.Header().Get("Content-Type") != "application/problem+json" {
+				t.Fatalf("expected problem+json, got %q", rec.Header().Get("Content-Type"))
+			}
+		})
+	}
+
+	rec = do(t, gw, "POST", "/api/orders", "", nil)
+	if rec.Code != 400 {
+		t.Fatalf("empty body: got %d", rec.Code)
+	}
+}
+
+func TestValidationErrorDetails(t *testing.T) {
+	gw := mustGateway(t, baseConfig(newEcho(t).URL))
+	rec := do(t, gw, "POST", "/api/orders", `{"sku":"ABC-1","qty":0}`, nil)
+	var p Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Errors) == 0 || p.Errors[0].Location != "/qty" || p.Errors[0].In != "body" || p.RequestID == "" {
+		t.Fatalf("unexpected problem: %+v", p)
+	}
+}
+
+func TestParamsQueryAndPathRewrite(t *testing.T) {
+	gw := mustGateway(t, baseConfig(newEcho(t).URL))
+
+	rec := do(t, gw, "GET", "/api/orders/42?expand=items", "", nil)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if e := decodeEcho(t, rec); e.Path != "/v1/orders/42" {
+		t.Fatalf("path %q", e.Path)
+	}
+	for target, want := range map[string]int{
+		"/api/orders/abc":              400, // param pattern
+		"/api/orders/42?expand=nope":   400, // enum
+		"/api/orders/42?unknown=1":     400, // additionalProperties
+		"/api/orders/42?a=1;b=2":       400, // malformed query
+		"/api/orders/42/../../admin":   400, // traversal (path guard)
+		"/api/orders/%2e%2e/admin":     400,
+		"/api/orders/42%2fadmin":       400, // encoded slash
+		"/api/orders/%252e%252e/admin": 400, // double encoding
+		"/nope":                        404,
+	} {
+		if rec := do(t, gw, "GET", target, "", nil); rec.Code != want {
+			t.Errorf("%s: got %d want %d: %s", target, rec.Code, want, rec.Body)
+		}
+	}
+	if rec := do(t, gw, "DELETE", "/api/orders/42", "", nil); rec.Code != 405 {
+		t.Errorf("method not allowed: got %d", rec.Code)
+	}
+
+	rec = do(t, gw, "GET", "/files/a/b%20c.txt", "", nil)
+	if e := decodeEcho(t, rec); e.Path != "/storage/a/b c.txt" {
+		t.Fatalf("wildcard path %q", e.Path)
+	}
+	if rec := do(t, gw, "GET", "/healthz", "", nil); rec.Code != 200 {
+		t.Fatalf("health %d", rec.Code)
+	}
+}
+
+func TestAPIKeyAuthAndIdentityForwarding(t *testing.T) {
+	t.Setenv("TEST_PARTNER_KEY", "partner-key-0123456789")
+	up := newEcho(t)
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  partners:
+    type: apikey
+    options:
+      keys: {acme: "env:TEST_PARTNER_KEY"}
+      scopes: {acme: [orders:read]}
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [partners]
+    requiredScopes: [orders:read]
+    forwardIdentity: {X-Client-Id: subject}
+    upstream: {targets: [%s]}
+  - name: admin
+    path: /admin
+    methods: [GET]
+    auth: [partners]
+    requiredScopes: [admin]
+    upstream: {targets: [%[1]s]}
+`, up.URL))
+
+	if rec := do(t, gw, "GET", "/r", "", nil); rec.Code != 401 || rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("no key: %d", rec.Code)
+	}
+	if rec := do(t, gw, "GET", "/r", "", map[string]string{"X-API-Key": "wrong-key-0123456789"}); rec.Code != 401 {
+		t.Fatalf("bad key: %d", rec.Code)
+	}
+	rec := do(t, gw, "GET", "/r", "", map[string]string{"X-API-Key": "partner-key-0123456789", "X-Client-Id": "spoofed"})
+	if rec.Code != 200 {
+		t.Fatalf("good key: %d %s", rec.Code, rec.Body)
+	}
+	e := decodeEcho(t, rec)
+	if e.Headers["X-Client-Id"] != "acme" || e.Headers["X-Api-Key"] != "" {
+		t.Fatalf("identity forwarding wrong: %+v", e.Headers)
+	}
+	if rec := do(t, gw, "GET", "/admin", "", map[string]string{"X-API-Key": "partner-key-0123456789"}); rec.Code != 403 {
+		t.Fatalf("scope: %d", rec.Code)
+	}
+}
+
+func signHS256(t *testing.T, secret string, claims map[string]any) string {
+	t.Helper()
+	enc := base64.RawURLEncoding
+	h := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	cb, _ := json.Marshal(claims)
+	in := h + "." + enc.EncodeToString(cb)
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write([]byte(in))
+	return in + "." + enc.EncodeToString(m.Sum(nil))
+}
+
+func TestJWTAuth(t *testing.T) {
+	secret := "0123456789abcdef0123456789abcdef"
+	t.Setenv("TEST_JWT_SECRET", secret)
+	up := newEcho(t)
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  jwt:
+    type: jwt
+    options:
+      algorithms: [HS256]
+      secret: env:TEST_JWT_SECRET
+      issuer: https://issuer.example
+      audience: [gateway]
+defaults:
+  auth: [jwt]
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    requiredScopes: [read]
+    forwardIdentity: {X-User: subject, X-Tenant: claims.tenant}
+    upstream: {targets: [%s]}
+`, up.URL))
+
+	now := time.Now().Unix()
+	good := map[string]any{"sub": "u1", "iss": "https://issuer.example", "aud": "gateway",
+		"exp": now + 60, "scope": "read write", "tenant": "t9"}
+	bearer := func(c map[string]any) map[string]string {
+		return map[string]string{"Authorization": "Bearer " + signHS256(t, secret, c)}
+	}
+	rec := do(t, gw, "GET", "/r", "", bearer(good))
+	if rec.Code != 200 {
+		t.Fatalf("valid token: %d %s", rec.Code, rec.Body)
+	}
+	if e := decodeEcho(t, rec); e.Headers["X-User"] != "u1" || e.Headers["X-Tenant"] != "t9" {
+		t.Fatalf("forwarded: %+v", e.Headers)
+	}
+
+	mut := func(k string, v any) map[string]any {
+		c := map[string]any{}
+		for kk, vv := range good {
+			c[kk] = vv
+		}
+		if v == nil {
+			delete(c, k)
+		} else {
+			c[k] = v
+		}
+		return c
+	}
+	for name, hdr := range map[string]map[string]string{
+		"expired":   bearer(mut("exp", now-10)),
+		"no exp":    bearer(mut("exp", nil)),
+		"bad iss":   bearer(mut("iss", "evil")),
+		"bad aud":   bearer(mut("aud", "other")),
+		"future":    bearer(mut("nbf", now+3600)),
+		"wrong key": {"Authorization": "Bearer " + signHS256(t, strings.Repeat("x", 32), good)},
+		"alg none": {"Authorization": "Bearer " + base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`)) +
+			"." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x","exp":9999999999}`)) + "."},
+		"garbage": {"Authorization": "Bearer abc"},
+	} {
+		if rec := do(t, gw, "GET", "/r", "", hdr); rec.Code != 401 {
+			t.Errorf("%s: got %d", name, rec.Code)
+		}
+	}
+	if rec := do(t, gw, "GET", "/r", "", bearer(mut("scope", "write"))); rec.Code != 403 {
+		t.Errorf("missing scope: got %d", rec.Code)
+	}
+}
+
+func TestCustomAuthenticatorAndMiddleware(t *testing.T) {
+	up := newEcho(t)
+	var hookRan bool
+	gw := mustGateway(t, fmt.Sprintf(`
+authenticators:
+  hdr:
+    type: header-token
+    options: {"token": "letmein"}
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [hdr]
+    middleware: [tag]
+    upstream: {targets: [%s]}
+`, up.URL),
+		WithAuthenticatorType("header-token", func(name string, raw json.RawMessage) (Authenticator, error) {
+			var o struct{ Token string }
+			if err := json.Unmarshal(raw, &o); err != nil {
+				return nil, err
+			}
+			return AuthenticatorFunc(func(r *http.Request) (*Principal, error) {
+				if r.Header.Get("X-Token") != o.Token {
+					return nil, ErrNoCredentials
+				}
+				return &Principal{Subject: "svc"}, nil
+			}), nil
+		}),
+		WithNamedMiddleware("tag", func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hookRan = PrincipalFrom(r.Context()) != nil
+				r.Header.Set("X-Tag", "1")
+				next.ServeHTTP(w, r)
+			})
+		}),
+	)
+	rec := do(t, gw, "GET", "/r", "", map[string]string{"X-Token": "letmein"})
+	if rec.Code != 200 || !hookRan || decodeEcho(t, rec).Headers["X-Tag"] != "1" {
+		t.Fatalf("custom auth/middleware: %d hook=%v", rec.Code, hookRan)
+	}
+	if rec := do(t, gw, "GET", "/r", "", nil); rec.Code != 401 {
+		t.Fatalf("unauthenticated: %d", rec.Code)
+	}
+}
+
+func TestRateLimitAndConcurrency(t *testing.T) {
+	up := newEcho(t)
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [anonymous]
+    hardening:
+      rateLimit: {requestsPerSecond: 1, burst: 2}
+    upstream: {targets: [%s]}
+`, up.URL))
+	codes := []int{}
+	for range 3 {
+		codes = append(codes, do(t, gw, "GET", "/r", "", nil).Code)
+	}
+	if codes[0] != 200 || codes[1] != 200 || codes[2] != 429 {
+		t.Fatalf("rate limit codes %v", codes)
+	}
+}
+
+func TestResponseValidation(t *testing.T) {
+	var body string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s]}
+    validation:
+      response:
+        schema:
+          type: object
+          required: [id]
+          additionalProperties: false
+          properties: {id: {type: integer}}
+`, up.URL))
+	body = `{"id":1}`
+	if rec := do(t, gw, "GET", "/r", "", nil); rec.Code != 200 || rec.Body.String() != body {
+		t.Fatalf("valid response: %d %s", rec.Code, rec.Body)
+	}
+	body = `{"id":1,"passwordHash":"leak"}`
+	rec := do(t, gw, "GET", "/r", "", nil)
+	if rec.Code != 502 || strings.Contains(rec.Body.String(), "leak") {
+		t.Fatalf("invalid response passed: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestUpstreamFailures(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer slow.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: slow
+    path: /slow
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s], timeout: 50ms}
+  - name: down
+    path: /down
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: ["http://127.0.0.1:1"]}
+`, slow.URL))
+	if rec := do(t, gw, "GET", "/slow", "", nil); rec.Code != 504 {
+		t.Fatalf("timeout: %d", rec.Code)
+	}
+	if rec := do(t, gw, "GET", "/down", "", nil); rec.Code != 502 {
+		t.Fatalf("down: %d", rec.Code)
+	}
+}
+
+func TestConfigErrors(t *testing.T) {
+	bad := map[string]string{
+		"unknown field":   "routes: []\nbogus: 1",
+		"no routes":       "routes: []",
+		"bad target":      "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [ftp://x]}}]",
+		"unknown auth":    "routes: [{name: a, path: /a, methods: [GET], auth: [nope], upstream: {targets: [http://x]}}]",
+		"bad schema":      "routes: [{name: a, path: /a, methods: [POST], auth: [anonymous], upstream: {targets: [http://x]}, validation: {body: {schema: {type: 5}}}}]",
+		"unknown param":   "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x], path: /b/{id}}}]",
+		"duplicate route": "routes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}, {name: b, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"bad pattern":     "routes: [{name: a, path: '/a/*/b', methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+		"bad duration":    "defaults: {timeout: 5}\nroutes: [{name: a, path: /a, methods: [GET], auth: [anonymous], upstream: {targets: [http://x]}}]",
+	}
+	for name, y := range bad {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := ParseConfig([]byte(y), true)
+			if err == nil {
+				_, err = New(cfg, WithLogger(quietLogger()))
+			}
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestClientIPResolution(t *testing.T) {
+	r := &clientIPResolver{}
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.1.1.1:1234"
+	req.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.9, 10.2.2.2")
+	if got := r.resolve(req); got != "10.1.1.1" {
+		t.Fatalf("untrusted: %s", got)
+	}
+	r.trusted = append(r.trusted, netip.MustParsePrefix("10.0.0.0/8"))
+	if got := r.resolve(req); got != "203.0.113.9" {
+		t.Fatalf("trusted: %s", got)
+	}
+}

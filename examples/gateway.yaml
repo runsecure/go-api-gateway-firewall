@@ -1,0 +1,104 @@
+# Example gateway configuration. Secrets use env: or file: references.
+server:
+  listen: ":8080"
+  readHeaderTimeout: 5s
+  readTimeout: 30s
+  writeTimeout: 60s
+  idleTimeout: 120s
+  shutdownTimeout: 15s
+  maxHeaderBytes: 32768
+  healthPath: /healthz
+  trustedProxies: [10.0.0.0/8]   # load balancer ranges allowed to set X-Forwarded-For
+  exposeValidationErrors: true
+
+defaults:
+  auth: [users]          # every route requires a user JWT unless overridden
+  timeout: 15s
+  hardening:
+    maxBodyBytes: 262144
+    maxUrlLength: 2048
+    maxQueryParams: 32
+    maxJsonDepth: 16
+    rejectDuplicateKeys: true
+    rateLimit: {requestsPerSecond: 50, burst: 100}
+  responseHeaders:
+    set:
+      Strict-Transport-Security: max-age=63072000; includeSubDomains
+
+authenticators:
+  users:
+    type: jwt
+    options:
+      algorithms: [RS256]
+      publicKey: file:/etc/gateway/jwt-public.pem
+      issuer: https://auth.example.com/
+      audience: [orders-api]
+      leeway: 30s
+  partners:
+    type: apikey
+    options:
+      header: X-API-Key
+      keys:
+        acme: env:ACME_API_KEY
+      scopes:
+        acme: [orders:read]
+
+routes:
+  - name: create-order
+    path: /api/orders
+    methods: [POST]
+    requiredScopes: [orders:write]
+    forwardIdentity:
+      X-User-Id: subject
+      X-Tenant-Id: claims.tenant
+    upstream:
+      targets: [http://orders-1:8080, http://orders-2:8080]
+      path: /v1/orders
+      maxConcurrent: 200
+    validation:
+      body:
+        file: schemas/order.json
+
+  - name: get-order
+    path: /api/orders/{id}
+    methods: [GET]
+    auth: [users, partners]     # first authenticator with credentials wins
+    requiredScopes: [orders:read]
+    forwardIdentity: {X-User-Id: subject}
+    upstream:
+      targets: [http://orders-1:8080, http://orders-2:8080]
+      path: /v1/orders/{id}
+    validation:
+      params:
+        schema:
+          type: object
+          properties:
+            id: {type: string, pattern: "^[0-9]{1,18}$"}
+      query:
+        schema:
+          type: object
+          additionalProperties: false
+          properties:
+            expand: {type: string, enum: [items, shipments]}
+      response:
+        statusCodes: [200]
+        schema:
+          type: object
+          required: [id, sku, quantity]
+          additionalProperties: false
+          properties:
+            id: {type: string}
+            sku: {type: string}
+            quantity: {type: integer}
+
+  - name: public-catalog
+    path: /catalog/*
+    methods: [GET, HEAD]
+    auth: [anonymous]
+    hardening:
+      rateLimit: {requestsPerSecond: 20, burst: 40}
+    upstream:
+      targets: [http://catalog:8080]
+      path: /{*}
+    responseHeaders:
+      set: {Cache-Control: "public, max-age=60"}

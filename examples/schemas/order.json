@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sku", "quantity"],
+  "properties": {
+    "sku": { "type": "string", "pattern": "^[A-Z0-9-]{3,32}$" },
+    "quantity": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "notes": { "type": "string", "maxLength": 500 },
+    "shipTo": { "$ref": "address.json" }
+  }
+}

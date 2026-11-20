@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["line1", "country"],
+  "properties": {
+    "line1": { "type": "string", "maxLength": 200 },
+    "city": { "type": "string", "maxLength": 100 },
+    "country": { "type": "string", "pattern": "^[A-Z]{2}$" }
+  }
+}
