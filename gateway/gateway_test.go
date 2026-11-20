@@ -951,7 +951,22 @@ routes:
 		if rec.Code != tc.want.status {
 			t.Errorf("%s: response %d, want %d", name, rec.Code, tc.want.status)
 		}
-		check(name, logs.accessLine(t, rec.Header().Get(RequestIDHeader)), tc.want)
+		line := logs.accessLine(t, rec.Header().Get(RequestIDHeader))
+		check(name, line, tc.want)
+
+		total, _ := line["duration_ms"].(float64)
+		upstream, called := line["upstream_duration_ms"].(float64)
+		calledUpstream := tc.want.upstreamStatus != 0 || tc.want.upstreamError != ""
+		switch {
+		case total <= 0:
+			t.Errorf("%s: duration_ms = %v", name, line["duration_ms"])
+		case called != calledUpstream:
+			t.Errorf("%s: upstream_duration_ms present=%v, want %v: %v", name, called, calledUpstream, line)
+		case called && (upstream <= 0 || upstream > total):
+			t.Errorf("%s: upstream_duration_ms %v outside (0, %v]", name, upstream, total)
+		case tc.want.upstreamError == "timeout" && upstream < 50:
+			t.Errorf("%s: upstream_duration_ms %v shorter than the 50ms timeout", name, upstream)
+		}
 	}
 
 	// Client disconnects while the upstream is still working.

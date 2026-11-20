@@ -43,6 +43,9 @@ type requestLog struct {
 	authenticator  string
 	upstreamStatus int
 	upstreamError  string
+	// upstreamTime is the upstream round trip up to its response headers;
+	// zero when no upstream call was made.
+	upstreamTime time.Duration
 }
 
 func requestLogFrom(ctx context.Context) *requestLog {
@@ -67,6 +70,15 @@ func (l *requestLog) setUpstreamStatus(status int) {
 		l.upstreamStatus = status
 	}
 }
+
+func (l *requestLog) setUpstreamTime(d time.Duration) {
+	if l != nil {
+		l.upstreamTime = d
+	}
+}
+
+// millis converts d to fractional milliseconds rounded to the microsecond.
+func millis(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 func (l *requestLog) setUpstreamError(kind string) {
 	if l != nil {
@@ -252,7 +264,7 @@ func entryMiddleware(logger *slog.Logger, ips *clientIPResolver, accessLog bool,
 							status = StatusClientClosedRequest
 						}
 					}
-					attrs := make([]slog.Attr, 0, 13)
+					attrs := make([]slog.Attr, 0, 16)
 					attrs = append(attrs,
 						slog.String("request_id", id),
 						slog.String("client_ip", ip),
@@ -276,10 +288,15 @@ func entryMiddleware(logger *slog.Logger, ips *clientIPResolver, accessLog bool,
 					if len(logged) > 0 {
 						attrs = append(attrs, slog.Attr{Key: "headers", Value: slog.GroupValue(logged...)})
 					}
+					elapsed := time.Since(start)
 					attrs = append(attrs,
 						slog.Int64("bytes", rec.bytes),
-						slog.Duration("duration", time.Since(start)),
+						slog.Duration("duration", elapsed),
+						slog.Float64("duration_ms", millis(elapsed)),
 					)
+					if rl.upstreamTime > 0 {
+						attrs = append(attrs, slog.Float64("upstream_duration_ms", millis(rl.upstreamTime)))
+					}
 					logger.LogAttrs(ctx, slog.LevelInfo, "request", attrs...)
 				}
 			}()

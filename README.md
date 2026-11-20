@@ -32,7 +32,9 @@ Each request writes one access-log record (`msg: "request"`) unless `server.acce
 | `upstream_status` | The status the upstream actually returned, before mapping. Absent when no upstream response was received. |
 | `upstream_error` | Why an upstream failure was replaced with a generic error: `status`, `timeout`, `unreachable`, `contract` or `concurrency_limit`. |
 | `headers` | Values of the inbound headers listed in `server.logHeaders`, keyed by lower-case name. Absent when none of them were sent. |
-| `bytes`, `duration` | Response body bytes and total time (nanoseconds in JSON). |
+| `bytes` | Response body bytes sent to the caller. |
+| `duration_ms` | Total time from when the gateway received the request headers until the last response byte was handed to the client connection. `duration` holds the same value in nanoseconds. |
+| `upstream_duration_ms` | Time from sending the request upstream until its response headers arrived, or until the call failed (for example the full timeout). Absent when no upstream call was made. The difference from `duration_ms` is gateway work plus streaming the body to the client. |
 
 Warnings and errors with more detail are logged separately and share the same `request_id`.
 

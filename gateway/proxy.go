@@ -149,7 +149,7 @@ type routeProxy struct {
 func (p *routeProxy) init(transport http.RoundTripper, buffers httputil.BufferPool) {
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:        p.rewrite,
-		Transport:      transport,
+		Transport:      timedTransport{transport},
 		BufferPool:     buffers,
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler:   p.errorHandler,
@@ -164,6 +164,18 @@ func (p *routeProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(ctx)
 	}
 	p.rp.ServeHTTP(&interimSuppressor{ResponseWriter: w, saved: w.Header().Clone()}, r)
+}
+
+// timedTransport records the upstream round trip time (until response
+// headers, or until failure) in the access log. ReverseProxy calls RoundTrip
+// on the request goroutine, so no synchronisation is needed.
+type timedTransport struct{ http.RoundTripper }
+
+func (t timedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	start := time.Now()
+	resp, err := t.RoundTripper.RoundTrip(r)
+	requestLogFrom(r.Context()).setUpstreamTime(time.Since(start))
+	return resp, err
 }
 
 // interimSuppressor stops upstream 1xx interim responses (100 Continue, 103
