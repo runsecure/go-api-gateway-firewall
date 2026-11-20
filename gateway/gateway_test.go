@@ -521,7 +521,7 @@ routes:
 	}
 	body = `{"id":1,"passwordHash":"leak"}`
 	rec := do(t, gw, "GET", "/r", "", nil)
-	if rec.Code != 502 || strings.Contains(rec.Body.String(), "leak") {
+	if rec.Code != 502 || strings.Contains(rec.Body.String(), "leak") || !strings.Contains(rec.Body.String(), `"detail":"bad gateway"`) {
 		t.Fatalf("invalid response passed: %d %s", rec.Code, rec.Body)
 	}
 }
@@ -547,11 +547,68 @@ routes:
     auth: [anonymous]
     upstream: {targets: ["http://127.0.0.1:1"]}
 `, slow.URL))
-	if rec := do(t, gw, "GET", "/slow", "", nil); rec.Code != 504 {
-		t.Fatalf("timeout: %d", rec.Code)
+	// Timeouts and connection failures are indistinguishable to the caller.
+	for _, path := range []string{"/slow", "/down"} {
+		rec := do(t, gw, "GET", path, "", nil)
+		var p Problem
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		if rec.Code != 502 || p.Detail != "bad gateway" {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
 	}
-	if rec := do(t, gw, "GET", "/down", "", nil); rec.Code != 502 {
-		t.Fatalf("down: %d", rec.Code)
+}
+
+func TestUpstreamErrorStatusMapping(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var code int
+		_, _ = fmt.Sscanf(r.URL.Path, "/s/%d", &code)
+		w.Header().Set("Server", "upstream/1.0")
+		w.Header().Set("WWW-Authenticate", `Basic realm="internal"`)
+		w.Header().Set("Retry-After", "17")
+		w.Header().Set("Set-Cookie", "session=secret")
+		w.Header().Set("X-Internal-Host", "db-7.internal")
+		w.WriteHeader(code)
+		_, _ = io.WriteString(w, "stack trace: secret-internal-detail")
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+routes:
+  - name: s
+    path: /s/{code}
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: [%s]}
+`, up.URL))
+
+	want := map[int]int{
+		200: 200, 204: 204,
+		400: 400, 401: 502, 402: 400, 403: 502, 404: 502, 405: 400, 407: 502,
+		409: 409, 410: 400, 413: 400, 415: 400, 418: 400, 422: 422, 429: 502, 431: 400,
+		500: 502, 501: 502, 502: 502, 503: 502, 504: 502, 599: 502,
+	}
+	for upstream, external := range want {
+		rec := do(t, gw, "GET", fmt.Sprintf("/s/%d", upstream), "", nil)
+		if rec.Code != external {
+			t.Errorf("upstream %d: got %d, want %d", upstream, rec.Code, external)
+		}
+		if upstream < 400 {
+			continue
+		}
+		if strings.Contains(rec.Body.String(), "secret") {
+			t.Errorf("upstream %d: body leaked: %s", upstream, rec.Body)
+		}
+		for _, h := range []string{"Server", "Www-Authenticate", "Retry-After", "Set-Cookie", "X-Internal-Host"} {
+			if v := rec.Header().Get(h); v != "" {
+				t.Errorf("upstream %d: header %s leaked: %q", upstream, h, v)
+			}
+		}
+		var p Problem
+		if err := json.Unmarshal(rec.Body.Bytes(), &p); err != nil {
+			t.Fatalf("upstream %d: not a problem body: %s", upstream, rec.Body)
+		}
+		if p.Status != external || p.Detail != upstreamErrorDetails[external] || p.Detail == "" {
+			t.Errorf("upstream %d: problem %+v", upstream, p)
+		}
 	}
 }
 

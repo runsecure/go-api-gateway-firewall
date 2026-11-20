@@ -222,7 +222,67 @@ func (p *routeProxy) peerTrusted(r *http.Request) bool {
 	return err == nil && p.ips.isTrusted(a)
 }
 
+// Upstream error statuses are never relayed verbatim: the status is mapped
+// through the tables below and the upstream headers and body are discarded in
+// favour of a gateway-authored problem response.
+
+// upstreamStatusMap lists the upstream error statuses with an explicit
+// external status. Anything absent falls back to upstreamClientErrorFallback
+// (4xx) or upstreamServerErrorFallback (5xx).
+var upstreamStatusMap = map[int]int{
+	// Statuses a client needs in order to behave correctly.
+	http.StatusConflict:            http.StatusConflict,
+	http.StatusUnprocessableEntity: http.StatusUnprocessableEntity,
+	// The gateway owns routing and authentication, so an upstream that
+	// rejects the credentials or the path points at a gateway-to-upstream
+	// fault the caller must not learn about.
+	http.StatusUnauthorized:      http.StatusBadGateway,
+	http.StatusForbidden:         http.StatusBadGateway,
+	http.StatusNotFound:          http.StatusBadGateway,
+	http.StatusProxyAuthRequired: http.StatusBadGateway,
+	// Upstream throttling reflects aggregate load on the gateway's own
+	// connection, not the caller's rate; the gateway's rate limiter is the
+	// only source of 429s.
+	http.StatusTooManyRequests: http.StatusBadGateway,
+}
+
+const (
+	upstreamClientErrorFallback = http.StatusBadRequest
+	upstreamServerErrorFallback = http.StatusBadGateway
+)
+
+// upstreamErrorDetails holds the only text sent for each external status.
+var upstreamErrorDetails = map[int]string{
+	http.StatusBadRequest:          "bad request",
+	http.StatusConflict:            "request conflicts with the current state",
+	http.StatusUnprocessableEntity: "request could not be processed",
+	http.StatusBadGateway:          "bad gateway",
+}
+
+// mapUpstreamStatus returns the status exposed to the caller for an upstream
+// error status.
+func mapUpstreamStatus(status int) int {
+	if mapped, ok := upstreamStatusMap[status]; ok {
+		return mapped
+	}
+	if status >= 500 {
+		return upstreamServerErrorFallback
+	}
+	return upstreamClientErrorFallback
+}
+
+// upstreamStatusError reports an upstream error status so errorHandler can
+// replace the response.
+type upstreamStatusError struct{ status int }
+
+func (e *upstreamStatusError) Error() string {
+	return fmt.Sprintf("upstream returned status %d", e.status)
+}
+
 func (p *routeProxy) modifyResponse(resp *http.Response) error {
+	if resp.StatusCode >= 400 {
+		return &upstreamStatusError{status: resp.StatusCode}
+	}
 	if p.respValid != nil {
 		if err := p.respValid.check(resp); err != nil {
 			return err
@@ -232,25 +292,35 @@ func (p *routeProxy) modifyResponse(resp *http.Response) error {
 	return nil
 }
 
+// errorHandler logs the real failure and answers through the same status
+// mapping as upstream error responses, so the caller cannot tell the failure
+// modes apart.
 func (p *routeProxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	ctx := r.Context()
+	var statusErr *upstreamStatusError
+	var status int
 	switch {
 	case errors.Is(err, context.Canceled) && ctx.Err() == context.Canceled:
 		// Client went away; nothing useful to send.
 		return
+	case errors.As(err, &statusErr):
+		status = statusErr.status
+		p.logger.WarnContext(ctx, "upstream error status", "route", p.name,
+			"request_id", RequestIDFrom(ctx), "upstream_status", status)
 	case errors.Is(err, context.DeadlineExceeded):
-		p.logger.WarnContext(ctx, "upstream timeout", "route", p.name, "request_id", RequestIDFrom(ctx))
-		p.respHeaders.apply(w.Header())
-		WriteProblem(w, r, http.StatusGatewayTimeout, "upstream timed out")
+		status = http.StatusGatewayTimeout
+		p.logger.WarnContext(ctx, "upstream timeout", "route", p.name,
+			"request_id", RequestIDFrom(ctx), "error", err)
 	case errors.Is(err, errResponseContract):
+		status = http.StatusBadGateway
 		p.logger.ErrorContext(ctx, "upstream response rejected", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
-		p.respHeaders.apply(w.Header())
-		WriteProblem(w, r, http.StatusBadGateway, "upstream response failed contract validation")
 	default:
+		status = http.StatusBadGateway
 		p.logger.WarnContext(ctx, "upstream error", "route", p.name,
 			"request_id", RequestIDFrom(ctx), "error", err)
-		p.respHeaders.apply(w.Header())
-		WriteProblem(w, r, http.StatusBadGateway, "upstream unavailable")
 	}
+	external := mapUpstreamStatus(status)
+	p.respHeaders.apply(w.Header())
+	WriteProblem(w, r, external, upstreamErrorDetails[external])
 }
