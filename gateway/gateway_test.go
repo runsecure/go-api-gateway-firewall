@@ -567,6 +567,7 @@ routes:
     upstream: {targets: [%[1]s]}
     validation:
       response:
+        statusCodes: [200]
         schema:
           type: object
           required: [id]
@@ -579,6 +580,7 @@ routes:
     upstream: {targets: [%[1]s]}
     validation:
       response:
+        statusCodes: [200]
         schema:
           $defs:
             item:
@@ -900,6 +902,7 @@ routes:
     upstream: {targets: [%[1]s]}
     validation:
       response:
+        statusCodes: [200]
         schema: {type: object, required: [name]}
   - name: down
     path: /down/x

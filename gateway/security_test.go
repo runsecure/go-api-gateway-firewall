@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -329,4 +331,176 @@ routes:
 			t.Fatalf("want h2c config error, got %v", err)
 		}
 	})
+}
+
+// With a response schema configured, nothing reaches the caller unfiltered:
+// not a status the schema does not cover, and not a value hidden behind a
+// duplicate key.
+func TestResponseFilterFailsClosed(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/created":
+			w.WriteHeader(http.StatusCreated)
+		case "/partial":
+			w.WriteHeader(http.StatusPartialContent)
+		case "/redirect":
+			w.WriteHeader(http.StatusFound)
+		case "/empty":
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case "/cached":
+			w.WriteHeader(http.StatusNotModified)
+			return
+		case "/dup":
+			_, _ = io.WriteString(w, `{"id":{"ssn":"leak"},"id":"1"}`)
+			return
+		case "/dup-nested":
+			_, _ = io.WriteString(w, `{"id":"1","tags":[{"n":"leak","n":"a"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"1","ssn":"leak"}`)
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+defaults: {auth: [anonymous]}
+routes:
+  - name: only-200
+    path: /a/*
+    methods: [GET, HEAD]
+    upstream: {targets: [%[1]s], path: "/{*}"}
+    validation:
+      response:
+        statusCodes: [200]
+        schema: &schema
+          type: object
+          additionalProperties: false
+          properties:
+            id: {type: string}
+            tags: {type: array, items: {type: object, properties: {n: {type: string}}}}
+  - name: several
+    path: /b/*
+    methods: [GET]
+    upstream: {targets: [%[1]s], path: "/{*}"}
+    validation:
+      response: {statusCodes: [200, 201], schema: *schema}
+`, up.URL))
+
+	for _, c := range []struct {
+		method, target string
+		code           int
+		body           string
+	}{
+		{"GET", "/a/ok", 200, `{"id":"1"}`},
+		{"GET", "/a/created", 502, ""},
+		{"GET", "/a/partial", 502, ""},
+		{"GET", "/a/redirect", 502, ""},
+		{"GET", "/a/dup", 502, ""},
+		{"GET", "/a/dup-nested", 502, ""},
+		{"GET", "/a/empty", 204, ""},
+		{"GET", "/a/cached", 304, ""},
+		{"HEAD", "/a/created", 201, ""},
+		{"GET", "/b/created", 201, `{"id":"1"}`},
+		{"GET", "/b/redirect", 502, ""},
+		{"GET", "/b/dup", 502, ""},
+	} {
+		rec := do(t, gw, c.method, c.target, "", nil)
+		if rec.Code != c.code || strings.Contains(rec.Body.String(), "leak") {
+			t.Errorf("%s %s: got %d %s, want %d", c.method, c.target, rec.Code, rec.Body, c.code)
+			continue
+		}
+		if c.code < 400 && rec.Body.String() != c.body {
+			t.Errorf("%s %s: body %q, want %q", c.method, c.target, rec.Body, c.body)
+		}
+	}
+}
+
+// Closing a pooled body ends it: the buffer goes back to the pool once and
+// is never read again.
+func TestPooledBodyClose(t *testing.T) {
+	pb := getPooledBody()
+	pb.buf.WriteString("hello world")
+	p := make([]byte, 5)
+	if n, err := pb.Read(p); n != 5 || err != nil || string(p) != "hello" {
+		t.Fatalf("read: %d %v %q", n, err, p)
+	}
+	if err := pb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := pb.Read(p); n != 0 || err == nil {
+		t.Fatalf("read after close: %d %v", n, err)
+	}
+	if err := pb.Close(); err != nil || pb.buf != nil {
+		t.Fatalf("second close: %v, buf %v", err, pb.buf)
+	}
+}
+
+// ReverseProxy closes the outbound body when the handler returns, which can
+// be while the transport is still sending it: here the upstream answers
+// without reading the body. Run with -race; before the fix this reported a
+// race between pooledBody.Read and Close, with the buffer already recycled.
+func TestPooledBodyClosedDuringRead(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	gw := mustGateway(t, fmt.Sprintf(`
+defaults: {auth: [anonymous]}
+routes:
+  - name: p
+    path: /p
+    methods: [POST]
+    upstream: {targets: [%s]}
+    validation: {body: {schema: {type: object}}}
+`, up.URL))
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	body := []byte(`{"a":"` + strings.Repeat("x", 900_000) + `"}`)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 25 {
+				resp, err := http.Post(srv.URL+"/p", "application/json", bytes.NewReader(body))
+				if err != nil {
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// A response schema must say which statuses it covers; there is no default.
+func TestResponseStatusCodesRequired(t *testing.T) {
+	for statusCodes, wantErr := range map[string]string{
+		"":                        "statusCodes is required",
+		"statusCodes: [],":        "statusCodes is required",
+		"statusCodes: [200,404],": "404 is not a 2xx or 3xx status",
+		"statusCodes: [101],":     "101 is not a 2xx or 3xx status",
+		"statusCodes: [200,302],": "",
+	} {
+		cfg, err := ParseConfig(fmt.Appendf(nil, `
+routes:
+  - name: r
+    path: /r
+    methods: [GET]
+    auth: [anonymous]
+    upstream: {targets: ["http://x"]}
+    validation:
+      response: {%s schema: {type: object}}
+`, statusCodes), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = New(cfg, WithLogger(quietLogger()))
+		switch {
+		case wantErr == "" && err != nil:
+			t.Errorf("%q: unexpected error %v", statusCodes, err)
+		case wantErr != "" && (err == nil || !strings.Contains(err.Error(), wantErr)):
+			t.Errorf("%q: got %v, want error containing %q", statusCodes, err, wantErr)
+		}
+	}
 }

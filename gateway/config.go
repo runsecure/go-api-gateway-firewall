@@ -169,8 +169,11 @@ type BodyValidation struct {
 // forwarded; a response that still violates the schema is replaced with 502.
 type ResponseValidation struct {
 	SchemaRef
-	// StatusCodes to validate; defaults to all 2xx.
-	StatusCodes []int `json:"statusCodes,omitempty"`
+	// StatusCodes the schema covers, e.g. [200, 201]. Required: there is no
+	// default, so every status the upstream may answer with is a deliberate
+	// choice. Entries must be 200-399; error statuses are never forwarded.
+	// Any other non-error status that can carry a body is replaced with 502.
+	StatusCodes []int `json:"statusCodes"`
 	// MaxBytes bounds the buffered response size (default 4 MiB).
 	MaxBytes int64 `json:"maxBytes,omitempty"`
 }
@@ -394,6 +397,16 @@ func (c *Config) Validate() error {
 		for _, s := range []*SchemaRef{r.Validation.Query, r.Validation.Params, bodyRef(r.Validation.Body), respRef(r.Validation.Response)} {
 			if s != nil && (len(s.Schema) == 0) == (s.File == "") {
 				add("routes.%s: each validation entry needs exactly one of schema or file", id)
+			}
+		}
+		if resp := r.Validation.Response; resp != nil {
+			if len(resp.StatusCodes) == 0 {
+				add("routes.%s: validation.response.statusCodes is required", id)
+			}
+			for _, code := range resp.StatusCodes {
+				if code < 200 || code > 399 {
+					add("routes.%s: validation.response.statusCodes: %d is not a 2xx or 3xx status", id, code)
+				}
 			}
 		}
 		if h := r.Hardening; h != nil && h.RateLimit != nil {

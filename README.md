@@ -118,11 +118,13 @@ Each validation entry takes either an inline `schema` or a `file` path (relative
 - **`body`**: validates JSON request bodies. `required` defaults to true. `contentTypes` defaults to `application/json` and `application/*+json`. A non-UTF-8 `charset` is rejected with 415.
 - **`query`**: the query string is converted to an object. A parameter that appears once becomes a string, and a repeated parameter becomes an array of strings. Set `additionalProperties: false` to allowlist parameters.
 - **`params`**: route params as an object of strings.
-- **`response`**: buffers the upstream response (up to `maxBytes`, default 4 MiB) for the listed `statusCodes` (default: all 2xx), strips every property the schema does not declare, then validates what is left. When this is enabled, the gateway negotiates encoding itself so it can decode compressed responses first.
+- **`response`**: buffers the upstream response (up to `maxBytes`, default 4 MiB) for the listed `statusCodes`, strips every property the schema does not declare, then validates what is left. When this is enabled, the gateway negotiates encoding itself so it can decode compressed responses first.
   - A property is kept when it is listed in `properties`, matches `patternProperties`, is named in `required`, or is admitted by `additionalProperties` / `unevaluatedProperties` (`true` or a schema). Declarations reached through `$ref`, `allOf`, `anyOf`, `oneOf` and `if`/`then`/`else` all count. Anything else is removed, including when `additionalProperties` is simply omitted.
   - An object whose schema says nothing about its properties (for example `{type: object}`) is forwarded whole, so declare `properties` on every object you want filtered.
   - Array elements are filtered in place and never removed.
-  - A response that still violates the schema after filtering (missing required property, wrong type, non-JSON content type, over `maxBytes`) is replaced with a generic **502** and logged.
+  - A response that still violates the schema after filtering (missing required property, wrong type, non-JSON content type, over `maxBytes`), or that contains duplicate object keys, is replaced with a generic **502** and logged.
+  - `statusCodes` is required and has no default, for example `[200, 201]`. The one schema applies to every listed status, each of which must be 2xx or 3xx.
+  - A status below 400 that is not listed is replaced with a 502, so list every status the upstream returns on success. Responses without a body (`HEAD`, 204, 304) are exempt. Statuses of 400 and above never reach the caller's body anyway: they are replaced with a gateway-written error.
   - A response with nothing to strip is forwarded byte for byte; otherwise it is re-encoded, which sorts object keys.
 
 A request that violates the contract gets an RFC 9457 `application/problem+json` 400 response:

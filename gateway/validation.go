@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -242,12 +241,18 @@ func queryToJSON(q url.Values) map[string]any {
 }
 
 // pooledBody is a replayable request body. Its buffer comes from a pool and
-// is returned when the transport closes the body. Each request gets its own
-// handle so a late or duplicate Close can never recycle a buffer in use.
+// is returned when the body is closed. Each request gets its own handle so a
+// late or duplicate Close can never recycle a buffer in use.
+//
+// Close can arrive while a Read is still running: ReverseProxy closes the
+// outbound body when the handler returns, even if the transport has not
+// finished sending it. The mutex makes Close wait for that Read, and later
+// Reads fail, so the buffer is never read after it has been recycled.
 type pooledBody struct {
+	mu     sync.Mutex
 	buf    *bytes.Buffer
 	r      bytes.Reader
-	closed atomic.Bool
+	closed bool
 	primed bool
 }
 
@@ -261,9 +266,15 @@ func getPooledBody() *pooledBody {
 	return &pooledBody{buf: b}
 }
 
+// Len is the body size. It is only valid before the body is handed on.
 func (p *pooledBody) Len() int { return p.buf.Len() }
 
 func (p *pooledBody) Read(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return 0, http.ErrBodyReadAfterClose
+	}
 	if !p.primed {
 		p.r.Reset(p.buf.Bytes())
 		p.primed = true
@@ -272,19 +283,24 @@ func (p *pooledBody) Read(b []byte) (int, error) {
 }
 
 func (p *pooledBody) Close() error {
-	if p.closed.CompareAndSwap(false, true) {
-		buf := p.buf
-		p.r.Reset(nil)
-		if buf.Cap() <= maxPooledBuffer {
-			bufPool.Put(buf)
-		}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
 	}
+	p.closed = true
+	p.r.Reset(nil)
+	if p.buf.Cap() <= maxPooledBuffer {
+		bufPool.Put(p.buf)
+	}
+	p.buf = nil
 	return nil
 }
 
 // responseValidator enforces the response contract via ModifyResponse.
 // Properties the schema does not declare are stripped; a response that still
-// violates the schema afterwards is rejected.
+// violates the schema afterwards is rejected, as is one whose status the
+// schema does not cover.
 type responseValidator struct {
 	schema   *jsonschema.Schema
 	statuses []int
@@ -295,18 +311,24 @@ type responseValidator struct {
 var errResponseContract = errors.New("upstream response violates contract")
 
 func (v *responseValidator) applies(status int) bool {
-	if len(v.statuses) == 0 {
-		return status >= 200 && status < 300
-	}
 	return slices.Contains(v.statuses, status)
 }
 
 // check filters and validates the response body, returning the number of
 // undeclared properties stripped from it.
 func (v *responseValidator) check(resp *http.Response) (stripped int, err error) {
-	if !v.applies(resp.StatusCode) || resp.Request.Method == http.MethodHead ||
-		resp.StatusCode == http.StatusNoContent {
+	switch {
+	case resp.Request.Method == http.MethodHead, resp.StatusCode == http.StatusNoContent,
+		resp.StatusCode == http.StatusNotModified:
+		// No body to check.
 		return 0, nil
+	case resp.StatusCode == http.StatusSwitchingProtocols:
+		// The route opted into upgrades; the "body" is the raw connection.
+		return 0, nil
+	case !v.applies(resp.StatusCode):
+		// Fail closed: a body the schema does not cover would otherwise
+		// reach the caller unfiltered.
+		return 0, fmt.Errorf("%w: status %d is not covered by the response schema", errResponseContract, resp.StatusCode)
 	}
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
 		return 0, fmt.Errorf("%w: cannot validate encoded response (%s)", errResponseContract, ce)
@@ -323,7 +345,9 @@ func (v *responseValidator) check(resp *http.Response) (stripped int, err error)
 	if int64(len(b)) > v.maxBytes {
 		return 0, fmt.Errorf("%w: response exceeds %d bytes", errResponseContract, v.maxBytes)
 	}
-	doc, err := parseJSON(b, 512, false)
+	// Duplicate keys are rejected: only the last value is validated, yet a
+	// conforming body is forwarded as received, earlier values included.
+	doc, err := parseJSON(b, 512, true)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", errResponseContract, err)
 	}
